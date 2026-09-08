@@ -95,6 +95,16 @@ local Config = {
         SlideBoost       = false,
         SlideMultiplier  = 3.5,
     },
+    GK = {
+        AutoDive         = false,   -- Otomatik kaleci atlayisi
+        SmartThreatOnly  = true,    -- Sadece kaleye gelen gercek sutlara atla (paslari ve autu eler)
+        PerfectCatch     = true,    -- Kesin top tutma / kacirmama (Touch & Catch kilidi)
+        DiveRange        = 42,      -- Algilama menzili (studs)
+        MinShotSpeed     = 25,      -- Sut hiz esigi (bu hiz altindaki yavas paslara atlamaz)
+        TimeToGoalMax    = 0.8,     -- En fazla kac saniye kala atlasin
+        TimeToGoalMin    = 0.12,    -- Cok gec kalmamak icin alt sinir
+        BoostPhysical    = true,    -- Sıçramaya ek ivme desteği
+    },
 }
 
 -- Baglanti Takip
@@ -356,6 +366,231 @@ local function GetGoalCorner(cornerName)
     return (cf * CFrame.new(off)).Position
 end
 
+-- Korudugumuz Kaleyi Bul (Kaleciye En Yakin Kale)
+local function GetMyGoal()
+    local root = GetRoot()
+    if not root then return nil, math.huge end
+    local goals = {}
+    for _, v in ipairs(workspace:GetDescendants()) do
+        if v:IsA("BasePart") and v.Size.X > 5 then
+            local n = v.Name:lower()
+            if n:find("goal") or n:find("kale") or n:find("net") or n:find("post") then
+                table.insert(goals, v)
+            end
+        end
+    end
+    if #goals == 0 then return nil, math.huge end
+
+    local closest, minD = nil, math.huge
+    for _, g in ipairs(goals) do
+        local d = (root.Position - g.Position).Magnitude
+        if d < minD then
+            minD = d
+            closest = g
+        end
+    end
+    return closest, minD
+end
+
+-- Oyundaki Kaleci Sicrama Butonunu Bul ve Tikla (Mobil & PC)
+local function PressInGameDiveButton()
+    local triggered = false
+
+    -- 1. PlayerGui altindaki dive/gk/save butonlarini tara ve tikla
+    local pgui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if pgui then
+        for _, btn in ipairs(pgui:GetDescendants()) do
+            if btn:IsA("GuiButton") and btn.Visible and btn.Active then
+                local n = btn.Name:lower()
+                local p = btn.Parent and btn.Parent.Name:lower() or ""
+                if n:find("dive") or n:find("gk") or n:find("keeper") or n:find("save") or n:find("leap")
+                   or p:find("dive") or p:find("gk") or p:find("keeper") then
+                    pcall(function()
+                        if firesignal then
+                            firesignal(btn.MouseButton1Down)
+                            firesignal(btn.Activated)
+                            firesignal(btn.TouchTap)
+                        end
+                        if btn.Activate then btn:Activate() end
+                    end)
+                    triggered = true
+                    break
+                end
+            end
+        end
+    end
+
+    -- 2. Remote Event / Function ile dogrudan sicrama atla
+    local diveRemotes = {
+        "GKDive", "Dive", "KeeperDive", "GK_Dive", "Save", "GoalieDive",
+        "KeeperSave", "Catch", "MobileDive", "Leap", "GKJump"
+    }
+    if SafeFireAny(diveRemotes) then
+        triggered = true
+    end
+
+    -- 3. Tus simülasyonu (PC / Emulator desteği)
+    pcall(function()
+        local vim = game:GetService("VirtualInputManager")
+        if vim then
+            vim:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+            task.delay(0.04, function()
+                vim:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+            end)
+        end
+    end)
+
+    return triggered
+end
+
+-- ===============================================================
+-- 🧤 GELISMIS AKILLI KALECI YAPAY ZEKASI (SMART GK AUTO-DIVE)
+-- ===============================================================
+local _lastDiveTime = 0
+
+local function RunGoalkeeperAI()
+    if not Config.GK.AutoDive then return end
+
+    local now = tick()
+    if now - _lastDiveTime < 0.9 then return end -- Cooldown (Spam engeli)
+
+    local ball = FindBall()
+    local myRoot = GetRoot()
+    local char = GetChar()
+    local hum = GetHum()
+    if not ball or not myRoot or not char or not hum then return end
+
+    -- Top zaten bizdeyse atlama
+    if DoIHaveBall() then return end
+
+    -- Korudugumuz kaleyi bul
+    local myGoal, distToGoal = GetMyGoal()
+    if not myGoal then return end
+
+    -- Kaleci kalesine yakin mi? (45 stud icinde olmali, orta sahadayken atlamasin)
+    if distToGoal > 45 then return end
+
+    local ballPos = ball.Position
+    local ballVel = ball.AssemblyLinearVelocity or Vector3.new(0, 0, 0)
+    local ballSpeed = ballVel.Magnitude
+
+    -- 1. PAS FILTRESI (Yavas yuvarlanan toplara veya paslara asla atlama!)
+    if Config.GK.SmartThreatOnly and ballSpeed < Config.GK.MinShotSpeed then
+        return
+    end
+
+    local myPos = myRoot.Position
+    local distToMe = (myPos - ballPos).Magnitude
+    if distToMe > Config.GK.DiveRange then return end
+
+    -- 2. ACI VE YON FILTRESI (Top bize veya kaleye dogru mu geliyor?)
+    local toMe = (myPos - ballPos).Unit
+    local toGoal = (myGoal.Position - ballPos).Unit
+    local dotMe = ballVel.Unit:Dot(toMe)
+    local dotGoal = ballVel.Unit:Dot(toGoal)
+
+    -- Top bizden veya kaleden uzaklasiyorsa ya da yan pas ise atlama!
+    if dotMe < 0.28 and dotGoal < 0.28 then
+        return
+    end
+
+    -- 3. ZAMANLAMA VE HEDEF KESISME HESABI (Time to Impact)
+    local closingSpeed = math.max(ballVel:Dot(toMe), 15)
+    local timeToArrive = distToMe / closingSpeed
+
+    -- Atlama zaman penceresi (Ne cok erken ne cok gec)
+    if timeToArrive < Config.GK.TimeToGoalMin or timeToArrive > Config.GK.TimeToGoalMax then
+        return
+    end
+
+    -- Yercekimi dahil tahmini varis noktasi
+    local g = -workspace.Gravity
+    local predictedBallPos = ballPos + (ballVel * timeToArrive) + Vector3.new(0, 0.5 * g * (timeToArrive ^ 2), 0)
+
+    -- 4. AUT VE TAC FILTRESI (Kalenin disina giden toplara atlama)
+    if Config.GK.SmartThreatOnly then
+        local goalSize = myGoal.Size
+        local goalPos = myGoal.Position
+        local offX = math.abs(predictedBallPos.X - goalPos.X)
+        local offZ = math.abs(predictedBallPos.Z - goalPos.Z)
+        local maxHoriz = math.max(goalSize.X, goalSize.Z) * 0.9 + 5
+
+        if offX > maxHoriz and offZ > maxHoriz then
+            return -- Auta gidiyor!
+        end
+
+        -- Diregin cok uzerinden ucuyorsa atlama
+        if (predictedBallPos.Y - goalPos.Y) > (goalSize.Y + 10) then
+            return
+        end
+    end
+
+    -- ═══════════════════════════════════════════════════════════
+    -- 🚀 HEDEF ŞUT ONAYLANDI: KESIN SICRAMA & TUTUS BASLATILIYOR!
+    -- ═══════════════════════════════════════════════════════════
+    _lastDiveTime = now
+
+    -- Kaleci ile topun bulusacagi ideal kurtaris noktasi
+    local interceptPos = myPos:Lerp(predictedBallPos, 0.65)
+    local diveVec = (interceptPos - myPos)
+    local diveDir2D = Vector3.new(diveVec.X, 0, diveVec.Z).Unit
+
+    -- A) Karakteri topun gelis acisina cevir ve yurut (oyunun yurume yonu mekanigi icin)
+    myRoot.CFrame = CFrame.new(myPos, myPos + diveDir2D)
+    hum:Move(diveDir2D, false)
+
+    -- B) Oyundaki kaleci sicrama butonunu bas
+    PressInGameDiveButton()
+
+    -- C) Fiziksel sicrama ve ivme destegi (Topu havada kacirmamak icin)
+    if Config.GK.BoostPhysical then
+        hum.Jump = true
+        local verticalImpulse = math.clamp((interceptPos.Y - myPos.Y) * 10 + 16, 12, 34)
+        local leapSpeed = math.clamp(diveVec.Magnitude * 18, 25, 48)
+        myRoot.AssemblyLinearVelocity = (diveDir2D * leapSpeed) + Vector3.new(0, verticalImpulse, 0)
+    end
+
+    -- D) KESIN TUTUS / TOPU YAKALAMA (100% Catch & Retention)
+    if Config.GK.PerfectCatch then
+        task.spawn(function()
+            local saveStart = tick()
+            while tick() - saveStart < 0.65 do
+                task.wait(0.03)
+                if not ball or not myRoot then break end
+
+                local curDist = (myRoot.Position - ball.Position).Magnitude
+                if curDist <= 6.5 then
+                    -- Tum vucut ve kollar ile temas kur
+                    local touchParts = {
+                        char:FindFirstChild("RightHand") or char:FindFirstChild("Right Arm"),
+                        char:FindFirstChild("LeftHand") or char:FindFirstChild("Left Arm"),
+                        char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso"),
+                        char:FindFirstChild("Head"),
+                        myRoot
+                    }
+                    for _, p in ipairs(touchParts) do
+                        if p and firetouchinterest then
+                            pcall(firetouchinterest, p, ball, 0)
+                            pcall(firetouchinterest, p, ball, 1)
+                            pcall(firetouchinterest, ball, p, 0)
+                            pcall(firetouchinterest, ball, p, 1)
+                        end
+                    end
+
+                    -- Topu kalecinin onunde kitle / yakala
+                    if curDist <= 4.0 then
+                        local handsPos = myRoot.Position + (myRoot.CFrame.LookVector * 1.5) + Vector3.new(0, 0.4, 0)
+                        ball.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                        ball.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                        ball.CFrame = CFrame.new(handsPos)
+                        break
+                    end
+                end
+            end
+        end)
+    end
+end
+
 -- ===============================================================
 -- 4. OYUN MEKANIKLERI
 -- ===============================================================
@@ -586,6 +821,9 @@ AddConn(RunService.Heartbeat:Connect(function()
             end
         end
     end
+
+    -- 7. GELİŞMİŞ KALECİ OTOMASYONU (SMART GK AUTO-DIVE)
+    pcall(RunGoalkeeperAI)
 end))
 
 -- B) SILENT AIM (SUT KONTROLU)
@@ -1646,7 +1884,27 @@ tBall:AddDropdown("Hedef Köşe", { "BottomLeft", "BottomRight", "TopLeft", "Top
 tBall:AddSlider("Aim Gücü", 0.2, 1.0, Config.Ball.SilentAimStrength, function(v) Config.Ball.SilentAimStrength = v end, "x")
 tBall:AddButton("⚽ Manuel Aim Uygula", function() pcall(ApplySilentAim) end)
 
--- 3. ESP (GÖRSEL ANALİZ)
+-- 3. GK (AKILLI KALECİ SİSTEMİ)
+local tGK = CreateTab("GK", "🧤")
+tGK:AddSection("🧤 Akıllı Kaleci Sıçraması (By Umut)")
+tGK:AddToggle("Otomatik Kaleci Atlama (Auto Dive)", Config.GK.AutoDive, function(v) Config.GK.AutoDive = v end, "Gelen tehlikeli sutlara dogru yonelerek kesin sicrar")
+tGK:AddToggle("Sadece Şutlara Atla (Pas Filtresi)", Config.GK.SmartThreatOnly, function(v) Config.GK.SmartThreatOnly = v end, "Paslara, yavas toplara veya auta gidenlere kesinlikle atlamaz")
+tGK:AddToggle("Kesin Top Tutma (100% Catch)", Config.GK.PerfectCatch, function(v) Config.GK.PerfectCatch = v end, "Top temas aninda ellerin arasinda kilitlenir, sekip gol olmaz")
+tGK:AddToggle("Fiziksel İvme Desteği", Config.GK.BoostPhysical, function(v) Config.GK.BoostPhysical = v end, "Topu havada yetisip cikarmak icin ekstra sicrama ivmesi verir")
+
+tGK:AddSection("⚙️ Kaleci İnce Ayarları")
+tGK:AddSlider("Şut Hız Eşiği (Pas Limiti)", 15, 55, Config.GK.MinShotSpeed, function(v) Config.GK.MinShotSpeed = v end, " spd")
+tGK:AddSlider("Kaleci Algılama Menzili", 15, 65, Config.GK.DiveRange, function(v) Config.GK.DiveRange = v end, " st")
+tGK:AddSlider("Atlama Zamanlaması", 0.3, 1.2, Config.GK.TimeToGoalMax, function(v) Config.GK.TimeToGoalMax = v end, " sn")
+tGK:AddButton("🧤 Manuel Topa Doğru Sıçra", function()
+    local oldThreat = Config.GK.SmartThreatOnly
+    Config.GK.SmartThreatOnly = false
+    _lastDiveTime = 0
+    pcall(RunGoalkeeperAI)
+    Config.GK.SmartThreatOnly = oldThreat
+end)
+
+-- 4. ESP (GÖRSEL ANALİZ)
 local tESP = CreateTab("ESP", "👁️")
 tESP:AddSection("👁️ Görsel Analiz (ESP)")
 tESP:AddToggle("Oyuncu ESP (Duvar Arkası)", Config.ESP.PlayerESP, function(v) Config.ESP.PlayerESP = v end, "Rakipleri duvar arkasindan parlatir ve mesafeyi gosterir")
