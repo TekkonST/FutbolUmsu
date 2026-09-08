@@ -1,7 +1,8 @@
 --[[
 ==================================================================
-        FutbolUmsu · Bundle.lua (V2 - MOBIL & MEKANIK FIX)
+        ⚽ FutbolUmsu · Script.lua (V2.5 - By Umut)
   Delta X · Arceus X · Hydrogen · Fluxus · Codex · KRNL Destekli
+  Modern Cyber Dark UI · Mobil & PC Uyumlu · Full Standalone
 ==================================================================
 --]]
 
@@ -132,40 +133,107 @@ local function Round(n, d)
     return math.floor(n * f + 0.5) / f
 end
 
--- Sahadaki Topu Bul (Gelistirilmis Arama)
-local function FindBall()
-    -- 1. Workspace direkt
-    local b = workspace:FindFirstChild(Config.Ball.BallName, true)
-    if b and b:IsA("BasePart") then return b end
+-- Sahadaki Topu Bul (Gelistirilmis Akilli Arama)
+local _cachedBall = nil
+local _lastBallSearch = 0
 
-    -- 2. Tag ile
+local function FindBall()
+    local now = tick()
+    if _cachedBall and _cachedBall.Parent and _cachedBall:IsA("BasePart") and (now - _lastBallSearch < 0.4) then
+        return _cachedBall
+    end
+    _lastBallSearch = now
+
+    -- 1. Workspace direkt config ismi
+    if Config.Ball.BallName and Config.Ball.BallName ~= "" then
+        local b = workspace:FindFirstChild(Config.Ball.BallName, true)
+        if b and b:IsA("BasePart") then
+            _cachedBall = b
+            return b
+        end
+    end
+
+    -- 2. CollectionService Tag ile
     local tagged = CollectionService:GetTagged("Ball")
     if tagged and #tagged > 0 then
         for _, t in ipairs(tagged) do
-            if t:IsA("BasePart") then return t end
+            if t:IsA("BasePart") then _cachedBall = t; return t end
             local bp = t:FindFirstChildOfClass("BasePart")
-            if bp then return bp end
+            if bp then _cachedBall = bp; return bp end
         end
     end
 
-    -- 3. Isminde 'ball' veya 'football' gecen part
-    for _, v in ipairs(workspace:GetChildren()) do
-        local n = v.Name:lower()
-        if n == "ball" or n:find("football") or n:find("soccer") then
-            if v:IsA("BasePart") then return v end
-            local bp = v:FindFirstChildOfClass("BasePart")
-            if bp then return bp end
+    -- 3. Workspace altındaki yaygın futbol topu isimleri
+    local commonNames = {"ball", "football", "soccerball", "soccer_ball", "tpsball", "gameball"}
+    for _, v in ipairs(workspace:GetDescendants()) do
+        if v:IsA("BasePart") then
+            local n = v.Name:lower()
+            for _, cname in ipairs(commonNames) do
+                if n == cname or n:find(cname) then
+                    -- Top boyut filtresi (çap 0.6 ile 10 studs arası)
+                    local sz = v.Size.Magnitude
+                    if sz > 0.6 and sz < 12 then
+                        _cachedBall = v
+                        return v
+                    end
+                end
+            end
         end
     end
-    return nil
+
+    return _cachedBall
 end
 
--- Top Sende mi?
+-- Top Sende mi? (Cok Katmanli Hassas Algilama)
 local function DoIHaveBall()
     local ball = FindBall()
     local root = GetRoot()
-    if not ball or not root then return false end
-    return (root.Position - ball.Position).Magnitude < 4.5
+    local char = GetChar()
+    if not ball or not root or not char then return false end
+
+    -- 1. Karakter modeline bagli mi? (Weld, Motor6D, Parent)
+    if ball:IsDescendantOf(char) then return true end
+    for _, child in ipairs(char:GetDescendants()) do
+        if child:IsA("JointInstance") or child:IsA("WeldConstraint") then
+            if child.Part0 == ball or child.Part1 == ball then
+                return true
+            end
+        end
+    end
+
+    -- 2. Attribute / Value kontrolu (Oyunun sahiplik verisi)
+    local ownerAttr = ball:GetAttribute("Owner") or ball:GetAttribute("Possession") or ball:GetAttribute("Holder") or ball:GetAttribute("Player")
+    if ownerAttr then
+        local attrStr = tostring(ownerAttr):lower()
+        if attrStr == LocalPlayer.Name:lower() or attrStr == tostring(LocalPlayer.UserId) then
+            return true
+        end
+    end
+    local ownerVal = ball:FindFirstChild("Owner") or ball:FindFirstChild("Possession") or ball:FindFirstChild("Holder")
+    if ownerVal and ownerVal:IsA("ValueBase") then
+        if ownerVal.Value == LocalPlayer or ownerVal.Value == char or tostring(ownerVal.Value):lower() == LocalPlayer.Name:lower() then
+            return true
+        end
+    end
+
+    -- 3. Dinamik Mesafe & En Yakin Oyuncu Kontrolu
+    local dist = (root.Position - ball.Position).Magnitude
+    if dist <= 6.5 then
+        -- Topa bizden daha yakin baska rakip var mi?
+        local isClosest = true
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character then
+                local pr = p.Character:FindFirstChild("HumanoidRootPart")
+                if pr and (pr.Position - ball.Position).Magnitude < (dist - 0.7) then
+                    isClosest = false
+                    break
+                end
+            end
+        end
+        return isClosest
+    end
+
+    return false
 end
 
 -- En Yakin Dusman
@@ -211,7 +279,7 @@ local function FindAllBoxes()
     return found
 end
 
--- Remote Bul ve Calistir
+-- Remote Bul ve Calistir (Gelistirilmis Coklu Arama)
 local _remoteCache = {}
 local function GetRemote(name)
     if _remoteCache[name] then return _remoteCache[name] end
@@ -230,9 +298,24 @@ end
 
 local function SafeFire(name, ...)
     local r = GetRemote(name)
-    if r and r:IsA("RemoteEvent") then
-        pcall(r.FireServer, r, ...)
-        return true
+    if r then
+        if r:IsA("RemoteEvent") then
+            pcall(r.FireServer, r, ...)
+            return true
+        elseif r:IsA("RemoteFunction") then
+            pcall(r.InvokeServer, r, ...)
+            return true
+        end
+    end
+    return false
+end
+
+-- Birden fazla adayi sirayla dener
+local function SafeFireAny(candidateNames, ...)
+    for _, cname in ipairs(candidateNames) do
+        if SafeFire(cname, ...) then
+            return true
+        end
     end
     return false
 end
@@ -282,128 +365,210 @@ local _lastTackle  = 0
 local _lastKO      = 0
 local _lastFeint   = 0
 
--- A) AUTO PARRY & ANTI-STEAL (TOP KORUMA)
+-- A) OYUN MOTORU DÖNGÜSÜ (HEARTBEAT)
 AddConn(RunService.Heartbeat:Connect(function()
     local now = tick()
     local myRoot = GetRoot()
-    if not myRoot then return end
+    local char = GetChar()
+    if not myRoot or not char then return end
 
-    -- 1. TOP KAYBETMEME (ANTI-STEAL AUTO FEINT)
-    -- Top sendeyken rakip yaklasirsa ve vurmaya/kaymaya calisirsa otomatik Dokunulmazlik (Feint) bas
+    -- ─────────────────────────────────────────────────────────
+    -- 1. TOP KAYBETMEME (ANTI-STEAL & BALL PROTECTION & SHIELDING)
+    -- ─────────────────────────────────────────────────────────
     if Config.Combat.AntiStealFeint and DoIHaveBall() then
-        if now - _lastFeint > 0.8 then
-            local enemy, dist = GetNearestEnemy(9)
-            if enemy and dist <= 8 then
-                local c = enemy.Character
-                local hum = c and c:FindFirstChildOfClass("Humanoid")
-                local anim = hum and hum:FindFirstChildOfClass("Animator")
-                local isAttacking = false
+        pcall(function()
+            local ball = FindBall()
+            if not ball then return end
 
+            -- Yere düşmeyi / sendelemeyi engelle (Anti-Ragdoll / Anti-Trip)
+            local hum = GetHum()
+            if hum then
+                hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+                hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+                if hum.PlatformStand then hum.PlatformStand = false end
+                if hum.Sit then hum.Sit = false end
+            end
+
+            local enemy, dist = GetNearestEnemy(10)
+            if enemy and enemy.Character then
+                local er = enemy.Character:FindFirstChild("HumanoidRootPart")
+                local ehum = enemy.Character:FindFirstChildOfClass("Humanoid")
+                if er then
+                    local isAttacking = false
+
+                    -- Animasyon kontrolü (Pcall korumalı, nil hatası vermez)
+                    local anim = ehum and ehum:FindFirstChildOfClass("Animator")
+                    if anim then
+                        for _, track in ipairs(anim:GetPlayingAnimationTracks()) do
+                            pcall(function()
+                                if track and track.Animation then
+                                    local name = tostring(track.Animation.Name):lower()
+                                    local id = tostring(track.Animation.AnimationId):lower()
+                                    if name:find("tackle") or name:find("slide") or name:find("punch") or name:find("kick")
+                                       or id:find("slide") or id:find("tackle") or id:find("punch") then
+                                        isAttacking = true
+                                    end
+                                end
+                            end)
+                            if isAttacking then break end
+                        end
+                    end
+
+                    -- Rakibin ani kayma hızı tespiti
+                    if er.AssemblyLinearVelocity and er.AssemblyLinearVelocity.Magnitude > 28 then
+                        isAttacking = true
+                    end
+
+                    -- A) TEHLİKE ANINDA ÇALIM / FEINT BAS
+                    if (isAttacking or dist < 5.5) and (now - _lastFeint > 0.35) then
+                        local feintList = { Config.Combat.FeintRemoteName, "Feint", "BodyFeint", "Dodge", "Evade", "Trick", "Skill" }
+                        if SafeFireAny(feintList) then
+                            _lastFeint = now
+                        end
+                    end
+
+                    -- B) FİZİKSEL TOP KALKANI (BALL SHIELDING)
+                    -- Topu rakibin erişemeyeceği TAM TERSİNE saklar! Rakip kayarsa boşa düşer.
+                    local oppDir = (myRoot.Position - er.Position).Unit
+                    local shieldPos = myRoot.Position + (oppDir * 1.9) - Vector3.new(0, 1.2, 0)
+                    if ball:IsA("BasePart") then
+                        ball.CFrame = CFrame.new(shieldPos)
+                        ball.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                        ball.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                    end
+                end
+            else
+                -- Rakip uzaktaysa topu ayağımızın hemen önünde güvenle tut
+                if ball:IsA("BasePart") and ball.AssemblyLinearVelocity.Magnitude > 40 then
+                    ball.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                end
+            end
+        end)
+    end
+
+    -- ─────────────────────────────────────────────────────────
+    -- 2. AUTO PARRY (SAVUNMA)
+    -- ─────────────────────────────────────────────────────────
+    if Config.Combat.AutoParry and now - _lastParry > Config.Combat.AutoParryDelay then
+        pcall(function()
+            local enemy, dist = GetNearestEnemy(Config.Combat.AutoParryRadius)
+            if enemy and dist <= Config.Combat.AutoParryRadius and enemy.Character then
+                local hum = enemy.Character:FindFirstChildOfClass("Humanoid")
+                local anim = hum and hum:FindFirstChildOfClass("Animator")
                 if anim then
                     for _, track in ipairs(anim:GetPlayingAnimationTracks()) do
-                        local name = track.Animation.Name:lower()
-                        local id = tostring(track.Animation.AnimationId):lower()
-                        if name:find("tackle") or name:find("slide") or name:find("punch") or name:find("kick")
-                           or id:find("slide") or id:find("tackle") then
-                            isAttacking = true
-                            break
-                        end
-                    end
-                end
-
-                -- Rakip 4 stud yakinimizdaysa veya saldiriyorsa FEINT BAS!
-                if isAttacking or dist < 5 then
-                    if SafeFire(Config.Combat.FeintRemoteName) then
-                        _lastFeint = now
-                    end
-                end
-            end
-        end
-    end
-
-    -- 2. AUTO PARRY (SAVUNMA)
-    if Config.Combat.AutoParry and now - _lastParry > Config.Combat.AutoParryDelay then
-        local enemy, dist = GetNearestEnemy(Config.Combat.AutoParryRadius)
-        if enemy and dist <= Config.Combat.AutoParryRadius then
-            local c = enemy.Character
-            local hum = c and c:FindFirstChildOfClass("Humanoid")
-            local anim = hum and hum:FindFirstChildOfClass("Animator")
-            if anim then
-                for _, track in ipairs(anim:GetPlayingAnimationTracks()) do
-                    local n = track.Animation.Name:lower()
-                    if n:find("punch") or n:find("tackle") or n:find("slide") or n:find("hit") then
-                        if SafeFire(Config.Combat.FeintRemoteName) then
-                            _lastParry = now
-                        end
-                        break
+                        local triggered = false
+                        pcall(function()
+                            if track and track.Animation then
+                                local n = tostring(track.Animation.Name):lower()
+                                local id = tostring(track.Animation.AnimationId):lower()
+                                if n:find("punch") or n:find("tackle") or n:find("slide") or n:find("hit") or id:find("slide") then
+                                    local feintList = { Config.Combat.FeintRemoteName, "Feint", "BodyFeint", "Dodge", "Evade" }
+                                    if SafeFireAny(feintList) then
+                                        _lastParry = now
+                                        triggered = true
+                                    end
+                                end
+                            end
+                        end)
+                        if triggered then break end
                     end
                 end
             end
-        end
+        end)
     end
 
+    -- ─────────────────────────────────────────────────────────
     -- 3. AUTO TACKLE
+    -- ─────────────────────────────────────────────────────────
     if Config.Combat.AutoTackle and now - _lastTackle > Config.Combat.TackleDelay then
-        local ball = FindBall()
-        if ball and not DoIHaveBall() then
-            local enemy, dist = GetNearestEnemy(Config.Combat.TackleRange)
-            if enemy then
-                local er = enemy.Character and enemy.Character:FindFirstChild("HumanoidRootPart")
-                if er and (er.Position - ball.Position).Magnitude < 4 then
-                    -- Top rakipte!
-                    myRoot.CFrame = CFrame.new(myRoot.Position, Vector3.new(er.Position.X, myRoot.Position.Y, er.Position.Z))
-                    if SafeFire(Config.Combat.TackleRemoteName, enemy) then
-                        _lastTackle = now
+        pcall(function()
+            local ball = FindBall()
+            if ball and not DoIHaveBall() then
+                local enemy, dist = GetNearestEnemy(Config.Combat.TackleRange)
+                if enemy and enemy.Character then
+                    local er = enemy.Character:FindFirstChild("HumanoidRootPart")
+                    if er and (er.Position - ball.Position).Magnitude < 4.5 then
+                        -- Top rakipte!
+                        myRoot.CFrame = CFrame.new(myRoot.Position, Vector3.new(er.Position.X, myRoot.Position.Y, er.Position.Z))
+                        local tackleList = { Config.Combat.TackleRemoteName, "Tackle", "Slide", "Steal" }
+                        if SafeFireAny(tackleList, enemy) then
+                            _lastTackle = now
+                        end
                     end
                 end
             end
-        end
+        end)
     end
 
+    -- ─────────────────────────────────────────────────────────
     -- 4. AUTO KNOCKOUT
+    -- ─────────────────────────────────────────────────────────
     if Config.Combat.AutoKnockout and now - _lastKO > Config.Combat.KODelay then
-        local enemy, dist = GetNearestEnemy(Config.Combat.KORange)
-        if enemy and enemy.Character then
-            local er = enemy.Character:FindFirstChild("HumanoidRootPart")
-            if er then
-                myRoot.CFrame = CFrame.new(myRoot.Position, Vector3.new(er.Position.X, myRoot.Position.Y, er.Position.Z))
-                if SafeFire(Config.Combat.PunchRemoteName, enemy) then
-                    _lastKO = now
+        pcall(function()
+            local enemy, dist = GetNearestEnemy(Config.Combat.KORange)
+            if enemy and enemy.Character then
+                local er = enemy.Character:FindFirstChild("HumanoidRootPart")
+                if er then
+                    myRoot.CFrame = CFrame.new(myRoot.Position, Vector3.new(er.Position.X, myRoot.Position.Y, er.Position.Z))
+                    local punchList = { Config.Combat.PunchRemoteName, "Punch", "Hit", "Attack" }
+                    if SafeFireAny(punchList, enemy) then
+                        _lastKO = now
+                    end
                 end
             end
-        end
+        end)
     end
 
-    -- 5. GERCEK TOP MIKNATISI & CALMA (MAGNET REACH / AUTO STEAL)
+    -- ─────────────────────────────────────────────────────────
+    -- 5. GERÇEK TOP ÇEKME & AYAĞA ALMA (MAGNET REACH / AUTO PULL)
+    -- ─────────────────────────────────────────────────────────
+    -- DİKKAT: Karakter ASLA topa ışınlanmaz! Top doğrudan ayağımıza çekilir.
     if Config.Ball.MagnetReach then
-        local ball = FindBall()
-        if ball and not DoIHaveBall() then
-            local dist = (myRoot.Position - ball.Position).Magnitude
-            if dist <= Config.Ball.ReachRadius and dist > 1.5 then
-                -- Yontem 1: firetouchinterest (Executor destekliyorsa %100 calisir)
-                if firetouchinterest then
-                    pcall(function()
-                        firetouchinterest(myRoot, ball, 0)
-                        task.wait()
-                        firetouchinterest(myRoot, ball, 1)
-                    end)
-                end
+        pcall(function()
+            local ball = FindBall()
+            if ball and not DoIHaveBall() then
+                local dist = (myRoot.Position - ball.Position).Magnitude
+                if dist <= Config.Ball.ReachRadius and dist > 1.2 then
+                    -- Ayak seviyesinde hedef nokta (karakterin 2 stud önü)
+                    local footTarget = myRoot.Position + (myRoot.CFrame.LookVector * 2.0) - Vector3.new(0, 1.2, 0)
 
-                -- Yontem 2: Blink Touch (Topun tam noktasina mikro temas yap)
-                -- Boylece sunucu Network Ownership'i dogrudan oyuncuya verir
-                local oldCF = myRoot.CFrame
-                local ballPos = ball.Position
-                myRoot.CFrame = CFrame.new(ballPos + Vector3.new(0, 0.5, 0))
-                task.wait(0.03)
-                myRoot.CFrame = oldCF
+                    -- 1. Fiziksel Çekim (Velocity & CFrame)
+                    if ball:IsA("BasePart") then
+                        local pullDir = (footTarget - ball.Position)
+                        local pullSpeed = math.clamp(pullDir.Magnitude * 32, 45, 95)
 
-                -- Top serbestse hizi bize yonlendir
-                if ball:IsA("BasePart") and ball.AssemblyLinearVelocity then
-                    local pullDir = (myRoot.Position - ball.Position).Unit
-                    ball.AssemblyLinearVelocity = pullDir * 60
+                        -- Topu doğrudan ayağa doğru fırlat/çek
+                        ball.AssemblyLinearVelocity = pullDir.Unit * pullSpeed
+                        ball.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                        pcall(function() ball.Velocity = pullDir.Unit * pullSpeed end)
+
+                        -- Top 3.5 stud yakına geldiğinde ayağın önüne sabitle
+                        if dist < 3.8 then
+                            ball.CFrame = CFrame.new(footTarget)
+                        end
+                    end
+
+                    -- 2. Ayak ile Temas Tetikleme (firetouchinterest)
+                    -- Oyunun top sahipliğini anında vermesi için ayaklarla temas simüle edilir
+                    if firetouchinterest then
+                        local touchParts = {
+                            char:FindFirstChild("Right Leg") or char:FindFirstChild("RightFoot"),
+                            char:FindFirstChild("Left Leg") or char:FindFirstChild("LeftFoot"),
+                            myRoot
+                        }
+                        for _, leg in ipairs(touchParts) do
+                            if leg then
+                                pcall(firetouchinterest, leg, ball, 0)
+                                pcall(firetouchinterest, leg, ball, 1)
+                                pcall(firetouchinterest, ball, leg, 0)
+                                pcall(firetouchinterest, ball, leg, 1)
+                            end
+                        end
+                    end
                 end
             end
-        end
+        end)
     end
 
     -- 6. HAREKET (SPEED & JUMP)
@@ -690,27 +855,30 @@ AddConn(RunService.RenderStepped:Connect(function()
 end))
 
 -- ===============================================================
--- 6. MOBIL GUI (TAM EKRAN UYUMLU, %100 GORUNUR)
+-- 6. PROFESYONEL MOBİL & PC GUI (BY UMUT - MODERN CYBER DARK)
 -- ===============================================================
 
 local THEME = {
-    BG         = Color3.fromRGB(16, 16, 22),
-    Surface    = Color3.fromRGB(24, 24, 34),
-    SurfaceAlt = Color3.fromRGB(32, 32, 46),
-    Accent     = Color3.fromRGB(70, 130, 255),
-    AccentGlow = Color3.fromRGB(90, 160, 255),
-    ON         = Color3.fromRGB(46, 204, 113),
-    OFF        = Color3.fromRGB(70, 70, 85),
-    TextMain   = Color3.fromRGB(245, 245, 255),
-    TextSub    = Color3.fromRGB(160, 160, 190),
-    Border     = Color3.fromRGB(55, 55, 75),
-    Danger     = Color3.fromRGB(231, 76, 60),
+    BG          = Color3.fromRGB(12, 14, 20),
+    Sidebar     = Color3.fromRGB(17, 20, 29),
+    Surface     = Color3.fromRGB(22, 26, 38),
+    SurfaceHover= Color3.fromRGB(28, 34, 50),
+    Border      = Color3.fromRGB(38, 46, 68),
+    BorderGlow  = Color3.fromRGB(0, 180, 255),
+    Accent      = Color3.fromRGB(0, 175, 255),
+    AccentAlt   = Color3.fromRGB(115, 80, 255),
+    ON          = Color3.fromRGB(0, 230, 135),
+    OFF         = Color3.fromRGB(48, 54, 72),
+    TextMain    = Color3.fromRGB(248, 250, 255),
+    TextSub     = Color3.fromRGB(145, 155, 178),
+    Gold        = Color3.fromRGB(255, 205, 55),
+    Danger      = Color3.fromRGB(255, 75, 95),
 }
 
 local viewSize = (Camera and Camera.ViewportSize.X > 100) and Camera.ViewportSize or Vector2.new(800, 600)
-local WIN_W = IS_MOBILE and math.clamp(viewSize.X - 30, 320, 520) or 540
-local WIN_H = IS_MOBILE and math.clamp(viewSize.Y - 40, 280, 420) or 420
-local TAB_W = IS_MOBILE and 100 or 120
+local WIN_W = IS_MOBILE and math.clamp(viewSize.X - 24, 320, 520) or 560
+local WIN_H = IS_MOBILE and math.clamp(viewSize.Y - 32, 280, 390) or 410
+local TAB_W = IS_MOBILE and 110 or 135
 
 local function MI(cls, props, parent)
     local inst = Instance.new(cls)
@@ -720,7 +888,7 @@ local function MI(cls, props, parent)
 end
 
 local function Corner(p, r)
-    return MI("UICorner", { CornerRadius = UDim.new(0, r or 6) }, p)
+    return MI("UICorner", { CornerRadius = UDim.new(0, r or 8) }, p)
 end
 
 local function Padding(p, t, b, l, r)
@@ -732,273 +900,596 @@ local function Padding(p, t, b, l, r)
     }, p)
 end
 
+local function Stroke(p, col, thick, trans)
+    return MI("UIStroke", {
+        Color = col or THEME.Border,
+        Thickness = thick or 1,
+        Transparency = trans or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, p)
+end
+
 local guiRoot = MI("ScreenGui", {
-    Name = "FU_GUI_V2",
+    Name = "FU_GUI_PRO_V3",
     ResetOnSpawn = false,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
     IgnoreGuiInset = true,
 }, GetSafeGuiParent())
 
--- 📱 FLOATING MENU BUTONU (Mobilde her an acip kapatmak icin)
+-- ===============================================================
+-- ✨ BY UMUT - SİNEMATİK AÇILIŞ EKRANI (SPLASH INTRO)
+-- ===============================================================
+task.spawn(function()
+    local splashOverlay = MI("Frame", {
+        Name = "SplashOverlay",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+        BackgroundTransparency = 0.5,
+        BorderSizePixel = 0,
+        ZIndex = 2500,
+    }, guiRoot)
+
+    local splashCard = MI("Frame", {
+        Name = "SplashCard",
+        Size = UDim2.new(0, 320, 0, 165),
+        Position = UDim2.new(0.5, -160, 0.5, -82),
+        BackgroundColor3 = THEME.BG,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        ZIndex = 2501,
+    }, splashOverlay)
+    Corner(splashCard, 14)
+    Stroke(splashCard, THEME.Accent, 1.8, 0.1)
+
+    -- Parlak Üst Gradient Çizgisi
+    local topBar = MI("Frame", {
+        Size = UDim2.new(1, 0, 0, 3),
+        BackgroundColor3 = THEME.Accent,
+        BorderSizePixel = 0,
+        ZIndex = 2502,
+    }, splashCard)
+    local uig = MI("UIGradient", {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, THEME.Accent),
+            ColorSequenceKeypoint.new(0.5, THEME.Gold),
+            ColorSequenceKeypoint.new(1, THEME.AccentAlt),
+        })
+    }, topBar)
+
+    MI("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 38),
+        Position = UDim2.new(0, 0, 0, 18),
+        BackgroundTransparency = 1,
+        Text = "⚽ FUTBOLUMSU",
+        TextColor3 = THEME.TextMain,
+        Font = Enum.Font.GothamBold,
+        TextSize = 22,
+        ZIndex = 2502,
+    }, splashCard)
+
+    -- BY UMUT ROZETİ
+    local byBadge = MI("Frame", {
+        Size = UDim2.new(0, 140, 0, 24),
+        Position = UDim2.new(0.5, -70, 0, 58),
+        BackgroundColor3 = Color3.fromRGB(32, 28, 16),
+        BorderSizePixel = 0,
+        ZIndex = 2502,
+    }, splashCard)
+    Corner(byBadge, 12)
+    Stroke(byBadge, THEME.Gold, 1.2, 0.2)
+
+    MI("TextLabel", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Text = "✨ By Umut ✨",
+        TextColor3 = THEME.Gold,
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        ZIndex = 2503,
+    }, byBadge)
+
+    MI("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 18),
+        Position = UDim2.new(0, 0, 0, 88),
+        BackgroundTransparency = 1,
+        Text = "Mobil & PC En İyi Performans Yüklendi",
+        TextColor3 = THEME.TextSub,
+        Font = Enum.Font.Gotham,
+        TextSize = 11,
+        ZIndex = 2502,
+    }, splashCard)
+
+    -- Progress Bar
+    local loadTrack = MI("Frame", {
+        Size = UDim2.new(0.85, 0, 0, 6),
+        Position = UDim2.new(0.075, 0, 0, 125),
+        BackgroundColor3 = THEME.Surface,
+        BorderSizePixel = 0,
+        ZIndex = 2502,
+    }, splashCard)
+    Corner(loadTrack, 3)
+
+    local loadFill = MI("Frame", {
+        Size = UDim2.new(0, 0, 1, 0),
+        BackgroundColor3 = THEME.Accent,
+        BorderSizePixel = 0,
+        ZIndex = 2503,
+    }, loadTrack)
+    Corner(loadFill, 3)
+
+    -- Dolum Animasyonu
+    TweenService:Create(loadFill, TweenInfo.new(1.1, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+        Size = UDim2.new(1, 0, 1, 0)
+    }):Play()
+
+    task.wait(1.4)
+
+    -- Fade Out & Kapanış
+    TweenService:Create(splashCard, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.In), {
+        Position = UDim2.new(0.5, -160, 0.4, -82),
+        BackgroundTransparency = 1
+    }):Play()
+    local t = TweenService:Create(splashOverlay, TweenInfo.new(0.35), { BackgroundTransparency = 1 })
+    t:Play()
+    t.Completed:Connect(function()
+        splashOverlay:Destroy()
+    end)
+end)
+
+-- ===============================================================
+-- 📱 YÜZEN MOBİL BUTON (FLOAT BUTTON)
+-- ===============================================================
 local floatBtn = MI("TextButton", {
     Name = "FloatToggle",
-    Size = UDim2.new(0, 46, 0, 46),
-    Position = UDim2.new(0, 14, 0.5, -23),
-    BackgroundColor3 = THEME.Accent,
+    Size = UDim2.new(0, 50, 0, 50),
+    Position = UDim2.new(0, 16, 0.5, -25),
+    BackgroundColor3 = THEME.Sidebar,
     Text = "⚽",
     TextColor3 = Color3.fromRGB(255, 255, 255),
     Font = Enum.Font.GothamBold,
-    TextSize = 22,
+    TextSize = 24,
     BorderSizePixel = 0,
-    ZIndex = 999,
+    ZIndex = 1200,
+    AutoButtonColor = false,
 }, guiRoot)
-Corner(floatBtn, 23)
-MI("UIStroke", { Color = Color3.fromRGB(255, 255, 255), Thickness = 1.5, Transparency = 0.2 }, floatBtn)
+Corner(floatBtn, 25)
+Stroke(floatBtn, THEME.Accent, 1.8, 0.1)
 
--- Buton surukleme
+-- Altında Mini By Umut Rozeti
+local miniTag = MI("TextLabel", {
+    Size = UDim2.new(0, 56, 0, 14),
+    Position = UDim2.new(0.5, -28, 1, 2),
+    BackgroundColor3 = Color3.fromRGB(15, 18, 26),
+    Text = "By Umut",
+    TextColor3 = THEME.Gold,
+    Font = Enum.Font.GothamBold,
+    TextSize = 9,
+    BorderSizePixel = 0,
+    ZIndex = 1201,
+}, floatBtn)
+Corner(miniTag, 4)
+Stroke(miniTag, THEME.Gold, 1, 0.4)
+
+-- Buton Dokunmatik & Fare ile Sürükleme
 do
     local drag, dragStart, startPos = false, nil, nil
     floatBtn.InputBegan:Connect(function(i)
         if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-            drag = true; dragStart = i.Position; startPos = floatBtn.Position
+            drag = true
+            dragStart = i.Position
+            startPos = floatBtn.Position
         end
     end)
     UserInputService.InputChanged:Connect(function(i)
         if drag and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
-            local d = i.Position - dragStart
-            floatBtn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            local delta = i.Position - dragStart
+            floatBtn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
         end
     end)
-    local function endDrag() drag = false end
-    floatBtn.InputEnded:Connect(endDrag)
-    UserInputService.InputEnded:Connect(endDrag)
+    local function stopDrag() drag = false end
+    floatBtn.InputEnded:Connect(stopDrag)
+    UserInputService.InputEnded:Connect(stopDrag)
 end
 
--- Ana Cerceve
+-- ===============================================================
+-- 🖥️ ANA PENCERE (MAIN FRAME)
+-- ===============================================================
 local mainFrame = MI("Frame", {
     Name = "MainFrame",
     Size = UDim2.new(0, WIN_W, 0, WIN_H),
     Position = UDim2.new(0.5, -WIN_W / 2, 0.5, -WIN_H / 2),
     BackgroundColor3 = THEME.BG,
     BorderSizePixel = 0,
+    ClipsDescendants = true,
+    Visible = true,
 }, guiRoot)
-Corner(mainFrame, 10)
-MI("UIStroke", { Color = THEME.Border, Thickness = 1.2 }, mainFrame)
+Corner(mainFrame, 12)
+Stroke(mainFrame, THEME.Border, 1.4)
 
 floatBtn.MouseButton1Click:Connect(function()
     mainFrame.Visible = not mainFrame.Visible
 end)
 
--- Baslik
-local titleBar = MI("Frame", {
-    Size = UDim2.new(1, 0, 0, 44),
-    BackgroundColor3 = THEME.Surface,
+-- ─────────────────────────────────────────────────────────
+-- BAŞLIK ÇUBUĞU (HEADER)
+-- ─────────────────────────────────────────────────────────
+local header = MI("Frame", {
+    Size = UDim2.new(1, 0, 0, 46),
+    BackgroundColor3 = THEME.Sidebar,
     BorderSizePixel = 0,
 }, mainFrame)
-Corner(titleBar, 10)
-MI("Frame", { Size = UDim2.new(1, 0, 0.5, 0), Position = UDim2.new(0, 0, 0.5, 0), BackgroundColor3 = THEME.Surface, BorderSizePixel = 0 }, titleBar)
-MI("Frame", { Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2), BackgroundColor3 = THEME.Accent, BorderSizePixel = 0 }, titleBar)
+Corner(header, 12)
+-- Alt köşelerin yuvarlaklığını düzeltmek için alt dolgu
+MI("Frame", { Size = UDim2.new(1, 0, 0, 10), Position = UDim2.new(0, 0, 1, -10), BackgroundColor3 = THEME.Sidebar, BorderSizePixel = 0 }, header)
+MI("Frame", { Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 1, -1), BackgroundColor3 = THEME.Border, BorderSizePixel = 0 }, header)
+
+-- Başlık Sürükleme
+do
+    local drag, dragStart, startPos = false, nil, nil
+    header.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            drag = true
+            dragStart = i.Position
+            startPos = mainFrame.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if drag and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local delta = i.Position - dragStart
+            mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+    local function endHeaderDrag() drag = false end
+    header.InputEnded:Connect(endHeaderDrag)
+    UserInputService.InputEnded:Connect(endHeaderDrag)
+end
+
+-- Sol Logo & Başlık
+local titleTxt = MI("TextLabel", {
+    Size = UDim2.new(0, 160, 1, 0),
+    Position = UDim2.new(0, 14, 0, 0),
+    BackgroundTransparency = 1,
+    Text = "⚽ FutbolUmsu",
+    TextColor3 = THEME.TextMain,
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, header)
+
+-- Altın Sarısı BY UMUT Rozeti
+local headerBadge = MI("Frame", {
+    Size = UDim2.new(0, 80, 0, 20),
+    Position = UDim2.new(0, 135, 0.5, -10),
+    BackgroundColor3 = Color3.fromRGB(36, 32, 18),
+    BorderSizePixel = 0,
+}, header)
+Corner(headerBadge, 6)
+Stroke(headerBadge, THEME.Gold, 1, 0.3)
 
 MI("TextLabel", {
-    Size = UDim2.new(1, -90, 1, 0), Position = UDim2.new(0, 14, 0, 0),
-    BackgroundTransparency = 1, Text = "⚽ FutbolUmsu v2.0 (Mobile Enhanced)",
-    TextColor3 = THEME.TextMain, Font = Enum.Font.GothamBold, TextSize = 13,
-    TextXAlignment = Enum.TextXAlignment.Left,
-}, titleBar)
+    Size = UDim2.fromScale(1, 1),
+    BackgroundTransparency = 1,
+    Text = "BY UMUT",
+    TextColor3 = THEME.Gold,
+    Font = Enum.Font.GothamBold,
+    TextSize = 10,
+}, headerBadge)
 
+-- Kapatma & Gizleme Butonları
 local closeBtn = MI("TextButton", {
-    Size = UDim2.new(0, 32, 0, 32), Position = UDim2.new(1, -38, 0.5, -16),
-    BackgroundColor3 = THEME.Danger, Text = "✕", TextColor3 = Color3.fromRGB(255, 255, 255),
-    Font = Enum.Font.GothamBold, TextSize = 14, BorderSizePixel = 0,
-}, titleBar)
+    Size = UDim2.new(0, 30, 0, 30),
+    Position = UDim2.new(1, -38, 0.5, -15),
+    BackgroundColor3 = Color3.fromRGB(35, 20, 25),
+    Text = "✕",
+    TextColor3 = THEME.Danger,
+    Font = Enum.Font.GothamBold,
+    TextSize = 13,
+    BorderSizePixel = 0,
+    AutoButtonColor = false,
+}, header)
 Corner(closeBtn, 6)
+Stroke(closeBtn, THEME.Danger, 1, 0.5)
 closeBtn.MouseButton1Click:Connect(function() mainFrame.Visible = false end)
 
--- Sol Sekme Alani
-local tabBar = MI("Frame", {
-    Size = UDim2.new(0, TAB_W, 1, -44), Position = UDim2.new(0, 0, 0, 44),
-    BackgroundColor3 = THEME.Surface, BorderSizePixel = 0,
+local minBtn = MI("TextButton", {
+    Size = UDim2.new(0, 30, 0, 30),
+    Position = UDim2.new(1, -74, 0.5, -15),
+    BackgroundColor3 = THEME.Surface,
+    Text = "—",
+    TextColor3 = THEME.TextSub,
+    Font = Enum.Font.GothamBold,
+    TextSize = 12,
+    BorderSizePixel = 0,
+    AutoButtonColor = false,
+}, header)
+Corner(minBtn, 6)
+Stroke(minBtn, THEME.Border, 1)
+minBtn.MouseButton1Click:Connect(function() mainFrame.Visible = false end)
+
+-- ─────────────────────────────────────────────────────────
+-- SOL SEKME MENÜSÜ (SIDEBAR)
+-- ─────────────────────────────────────────────────────────
+local sidebar = MI("Frame", {
+    Size = UDim2.new(0, TAB_W, 1, -46),
+    Position = UDim2.new(0, 0, 0, 46),
+    BackgroundColor3 = THEME.Sidebar,
+    BorderSizePixel = 0,
 }, mainFrame)
-MI("Frame", { Size = UDim2.new(0, 1, 1, 0), Position = UDim2.new(1, -1, 0, 0), BackgroundColor3 = THEME.Border, BorderSizePixel = 0 }, tabBar)
+MI("Frame", { Size = UDim2.new(0, 1, 1, 0), Position = UDim2.new(1, -1, 0, 0), BackgroundColor3 = THEME.Border, BorderSizePixel = 0 }, sidebar)
 
 local tabList = MI("ScrollingFrame", {
-    Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
-    BorderSizePixel = 0, ScrollBarThickness = 2,
-    AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(0, 0, 0, 260),
-}, tabBar)
-Padding(tabList, 8, 8, 6, 6)
+    Size = UDim2.new(1, 0, 1, -28),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 0,
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, sidebar)
+Padding(tabList, 10, 10, 8, 8)
 MI("UIListLayout", { FillDirection = Enum.FillDirection.Vertical, Padding = UDim.new(0, 6) }, tabList)
 
--- Sag Icerik Alani
+-- Alt İmza
+local footerSign = MI("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 24),
+    Position = UDim2.new(0, 0, 1, -24),
+    BackgroundTransparency = 1,
+    Text = "v2.5 • By Umut",
+    TextColor3 = Color3.fromRGB(100, 110, 135),
+    Font = Enum.Font.Gotham,
+    TextSize = 10,
+}, sidebar)
+
+-- ─────────────────────────────────────────────────────────
+-- SAĞ İÇERİK ALANI (CONTENT AREA)
+-- ─────────────────────────────────────────────────────────
 local contentArea = MI("Frame", {
-    Size = UDim2.new(1, -TAB_W, 1, -44), Position = UDim2.new(0, TAB_W, 0, 44),
-    BackgroundTransparency = 1, BorderSizePixel = 0, ClipsDescendants = true,
+    Size = UDim2.new(1, -TAB_W, 1, -46),
+    Position = UDim2.new(0, TAB_W, 0, 46),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
 }, mainFrame)
 
--- Sekme Fonksiyonlari
 local Tabs = {}
 local CurrentTab = nil
 
 local function SelectTab(name)
     if CurrentTab and Tabs[CurrentTab] then
         Tabs[CurrentTab].page.Visible = false
-        Tabs[CurrentTab].btn.BackgroundColor3 = THEME.SurfaceAlt
+        Tabs[CurrentTab].btn.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        Tabs[CurrentTab].btn.BackgroundTransparency = 1
         Tabs[CurrentTab].btn.TextColor3 = THEME.TextSub
+        if Tabs[CurrentTab].indicator then Tabs[CurrentTab].indicator.Visible = false end
     end
     CurrentTab = name
     if Tabs[name] then
         Tabs[name].page.Visible = true
-        Tabs[name].btn.BackgroundColor3 = THEME.Accent
+        Tabs[name].btn.BackgroundColor3 = THEME.Surface
+        Tabs[name].btn.BackgroundTransparency = 0
         Tabs[name].btn.TextColor3 = THEME.TextMain
+        if Tabs[name].indicator then Tabs[name].indicator.Visible = true end
     end
 end
 
 local function CreateTab(name, icon)
     local btn = MI("TextButton", {
-        Size = UDim2.new(1, 0, 0, IS_MOBILE and 42 or 36),
-        BackgroundColor3 = THEME.SurfaceAlt,
-        Text = (icon and icon .. " " or "") .. name,
+        Size = UDim2.new(1, 0, 0, IS_MOBILE and 40 or 36),
+        BackgroundColor3 = THEME.Surface,
+        BackgroundTransparency = 1,
+        Text = (icon and icon .. "  " or "") .. name,
         TextColor3 = THEME.TextSub,
         Font = Enum.Font.GothamBold,
         TextSize = IS_MOBILE and 12 or 11,
-        BorderSizePixel = 0, AutoButtonColor = false,
+        BorderSizePixel = 0,
+        AutoButtonColor = false,
+        TextXAlignment = Enum.TextXAlignment.Left,
     }, tabList)
-    Corner(btn, 6)
+    Corner(btn, 7)
+    Padding(btn, 0, 0, 12, 6)
+
+    -- Sol tarafındaki aktif mavi neon çizgi
+    local indicator = MI("Frame", {
+        Size = UDim2.new(0, 3, 0.6, 0),
+        Position = UDim2.new(0, -6, 0.2, 0),
+        BackgroundColor3 = THEME.Accent,
+        BorderSizePixel = 0,
+        Visible = false,
+    }, btn)
+    Corner(indicator, 2)
 
     local page = MI("ScrollingFrame", {
-        Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
-        BorderSizePixel = 0, ScrollBarThickness = 5,
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 4,
         ScrollBarImageColor3 = THEME.Accent,
         ScrollingDirection = Enum.ScrollingDirection.Y,
         AutomaticCanvasSize = Enum.AutomaticSize.Y,
-        CanvasSize = UDim2.new(0, 0, 0, 650),
         Visible = false,
     }, contentArea)
-    Padding(page, 10, 16, 10, 10)
+    Padding(page, 10, 16, 12, 12)
     local pageLayout = MI("UIListLayout", { FillDirection = Enum.FillDirection.Vertical, Padding = UDim.new(0, 8) }, page)
-
-    pageLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-        page.CanvasSize = UDim2.new(0, 0, 0, pageLayout.AbsoluteContentSize.Y + 40)
-    end)
 
     btn.MouseButton1Click:Connect(function() SelectTab(name) end)
 
-    local tabObj = { name = name, btn = btn, page = page, totalH = 0 }
+    local tabObj = { name = name, btn = btn, indicator = indicator, page = page }
 
+    -- Başlık Bölümü (Section)
     function tabObj:AddSection(title)
         local sec = MI("Frame", { Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1 }, self.page)
         MI("TextLabel", {
-            Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
-            Text = title, TextColor3 = THEME.AccentGlow,
-            Font = Enum.Font.GothamBold, TextSize = 12,
+            Size = UDim2.fromScale(1, 1),
+            BackgroundTransparency = 1,
+            Text = string.upper(title),
+            TextColor3 = THEME.Accent,
+            Font = Enum.Font.GothamBold,
+            TextSize = 11,
             TextXAlignment = Enum.TextXAlignment.Left,
         }, sec)
-        MI("Frame", { Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 1, -1), BackgroundColor3 = THEME.Accent, BackgroundTransparency = 0.6, BorderSizePixel = 0 }, sec)
-        self.totalH = self.totalH + 34
-        self.page.CanvasSize = UDim2.new(0, 0, 0, self.totalH + 60)
+        local line = MI("Frame", {
+            Size = UDim2.new(1, 0, 0, 1),
+            Position = UDim2.new(0, 0, 1, -2),
+            BackgroundColor3 = THEME.Border,
+            BorderSizePixel = 0,
+        }, sec)
     end
 
+    -- Modern Toggle (Aç/Kapa Switch)
     function tabObj:AddToggle(title, defaultVal, callback, desc)
         local state = defaultVal or false
-        local rowH = desc and (IS_MOBILE and 56 or 48) or (IS_MOBILE and 44 or 38)
-        local row = MI("Frame", { Size = UDim2.new(1, 0, 0, rowH), BackgroundColor3 = THEME.SurfaceAlt, BorderSizePixel = 0 }, self.page)
-        Corner(row, 6)
-        Padding(row, 6, 6, 10, 10)
+        local cardH = desc and (IS_MOBILE and 54 or 48) or (IS_MOBILE and 42 or 38)
+        local card = MI("Frame", {
+            Size = UDim2.new(1, 0, 0, cardH),
+            BackgroundColor3 = THEME.Surface,
+            BorderSizePixel = 0,
+        }, self.page)
+        Corner(card, 8)
+        Stroke(card, THEME.Border, 1)
+        Padding(card, 6, 6, 12, 12)
 
+        local labelH = desc and 18 or cardH - 12
         MI("TextLabel", {
-            Size = UDim2.new(1, -60, 0, 18), BackgroundTransparency = 1,
-            Text = title, TextColor3 = THEME.TextMain,
-            Font = Enum.Font.GothamBold, TextSize = IS_MOBILE and 13 or 12,
+            Size = UDim2.new(1, -55, 0, labelH),
+            BackgroundTransparency = 1,
+            Text = title,
+            TextColor3 = THEME.TextMain,
+            Font = Enum.Font.GothamBold,
+            TextSize = IS_MOBILE and 12 or 11,
             TextXAlignment = Enum.TextXAlignment.Left,
-        }, row)
+        }, card)
 
         if desc then
             MI("TextLabel", {
-                Size = UDim2.new(1, -60, 0, 14), Position = UDim2.new(0, 0, 0, 20),
-                BackgroundTransparency = 1, Text = desc, TextColor3 = THEME.TextSub,
-                Font = Enum.Font.Gotham, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
-            }, row)
+                Size = UDim2.new(1, -55, 0, 14),
+                Position = UDim2.new(0, 0, 0, 20),
+                BackgroundTransparency = 1,
+                Text = desc,
+                TextColor3 = THEME.TextSub,
+                Font = Enum.Font.Gotham,
+                TextSize = 10,
+                TextXAlignment = Enum.TextXAlignment.Left,
+            }, card)
         end
 
-        local trackW, trackH = 46, 24
-        local track = MI("Frame", {
-            Size = UDim2.new(0, trackW, 0, trackH), Position = UDim2.new(1, -trackW, 0.5, -trackH / 2),
-            BackgroundColor3 = state and THEME.ON or THEME.OFF, BorderSizePixel = 0,
-        }, row)
-        Corner(track, trackH / 2)
+        -- Switch Kutusu
+        local swW, swH = 44, 22
+        local sw = MI("Frame", {
+            Size = UDim2.new(0, swW, 0, swH),
+            Position = UDim2.new(1, -swW, 0.5, -swH / 2),
+            BackgroundColor3 = state and THEME.ON or THEME.OFF,
+            BorderSizePixel = 0,
+        }, card)
+        Corner(sw, swH / 2)
 
-        local knobSize = trackH - 4
-        local knob = MI("Frame", {
-            Size = UDim2.new(0, knobSize, 0, knobSize),
-            Position = state and UDim2.new(0, trackW - knobSize - 2, 0.5, -knobSize / 2) or UDim2.new(0, 2, 0.5, -knobSize / 2),
-            BackgroundColor3 = Color3.fromRGB(255, 255, 255), BorderSizePixel = 0,
-        }, track)
-        Corner(knob, knobSize / 2)
+        local dotSize = swH - 4
+        local dot = MI("Frame", {
+            Size = UDim2.new(0, dotSize, 0, dotSize),
+            Position = state and UDim2.new(0, swW - dotSize - 2, 0.5, -dotSize / 2) or UDim2.new(0, 2, 0.5, -dotSize / 2),
+            BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+            BorderSizePixel = 0,
+        }, sw)
+        Corner(dot, dotSize / 2)
 
-        local clickBtn = MI("TextButton", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 10 }, row)
-        local function Toggle(v)
-            state = v
-            TweenService:Create(track, TweenInfo.new(0.15), { BackgroundColor3 = state and THEME.ON or THEME.OFF }):Play()
-            TweenService:Create(knob, TweenInfo.new(0.15), { Position = state and UDim2.new(0, trackW - knobSize - 2, 0.5, -knobSize / 2) or UDim2.new(0, 2, 0.5, -knobSize / 2) }):Play()
+        local clickBtn = MI("TextButton", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 5 }, card)
+        local function SetToggle(val)
+            state = val
+            TweenService:Create(sw, TweenInfo.new(0.18), { BackgroundColor3 = state and THEME.ON or THEME.OFF }):Play()
+            TweenService:Create(dot, TweenInfo.new(0.18), {
+                Position = state and UDim2.new(0, swW - dotSize - 2, 0.5, -dotSize / 2) or UDim2.new(0, 2, 0.5, -dotSize / 2)
+            }):Play()
             pcall(callback, state)
         end
-        clickBtn.MouseButton1Click:Connect(function() Toggle(not state) end)
+        clickBtn.MouseButton1Click:Connect(function() SetToggle(not state) end)
 
-        self.totalH = self.totalH + rowH + 8
-        self.page.CanvasSize = UDim2.new(0, 0, 0, self.totalH + 60)
-        return { Set = Toggle }
+        return { Set = SetToggle }
     end
 
+    -- Modern Slider (Hassas Kaydırıcı)
     function tabObj:AddSlider(title, minVal, maxVal, defaultVal, callback, suffix)
         suffix = suffix or ""
         local val = math.clamp(defaultVal or minVal, minVal, maxVal)
-        local rowH = IS_MOBILE and 58 or 52
-        local row = MI("Frame", { Size = UDim2.new(1, 0, 0, rowH), BackgroundColor3 = THEME.SurfaceAlt, BorderSizePixel = 0 }, self.page)
-        Corner(row, 6)
-        Padding(row, 8, 8, 10, 10)
+        local cardH = IS_MOBILE and 56 or 50
+        local card = MI("Frame", {
+            Size = UDim2.new(1, 0, 0, cardH),
+            BackgroundColor3 = THEME.Surface,
+            BorderSizePixel = 0,
+        }, self.page)
+        Corner(card, 8)
+        Stroke(card, THEME.Border, 1)
+        Padding(card, 8, 8, 12, 12)
 
-        local header = MI("Frame", { Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1 }, row)
+        local topRow = MI("Frame", { Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1 }, card)
         MI("TextLabel", {
-            Size = UDim2.new(0.65, 0, 1, 0), BackgroundTransparency = 1,
-            Text = title, TextColor3 = THEME.TextMain,
-            Font = Enum.Font.GothamBold, TextSize = IS_MOBILE and 13 or 12,
+            Size = UDim2.new(0.7, 0, 1, 0),
+            BackgroundTransparency = 1,
+            Text = title,
+            TextColor3 = THEME.TextMain,
+            Font = Enum.Font.GothamBold,
+            TextSize = IS_MOBILE and 12 or 11,
             TextXAlignment = Enum.TextXAlignment.Left,
-        }, header)
-        local valLbl = MI("TextLabel", {
-            Size = UDim2.new(0.35, 0, 1, 0), Position = UDim2.new(0.65, 0, 0, 0),
-            BackgroundTransparency = 1, Text = tostring(val) .. suffix,
-            TextColor3 = THEME.AccentGlow, Font = Enum.Font.GothamBold,
-            TextSize = IS_MOBILE and 13 or 12, TextXAlignment = Enum.TextXAlignment.Right,
-        }, header)
+        }, topRow)
 
-        local track = MI("Frame", { Size = UDim2.new(1, 0, 0, 8), Position = UDim2.new(0, 0, 0, 26), BackgroundColor3 = Color3.fromRGB(45, 45, 60), BorderSizePixel = 0 }, row)
-        Corner(track, 4)
-        local fill = MI("Frame", { Size = UDim2.new((val - minVal) / (maxVal - minVal), 0, 1, 0), BackgroundColor3 = THEME.Accent, BorderSizePixel = 0 }, track)
-        Corner(fill, 4)
+        local valBadge = MI("TextLabel", {
+            Size = UDim2.new(0.3, 0, 1, 0),
+            Position = UDim2.new(0.7, 0, 0, 0),
+            BackgroundTransparency = 1,
+            Text = tostring(val) .. suffix,
+            TextColor3 = THEME.Accent,
+            Font = Enum.Font.GothamBold,
+            TextSize = IS_MOBILE and 12 or 11,
+            TextXAlignment = Enum.TextXAlignment.Right,
+        }, topRow)
+
+        -- Ray
+        local track = MI("Frame", {
+            Size = UDim2.new(1, 0, 0, 6),
+            Position = UDim2.new(0, 0, 0, 28),
+            BackgroundColor3 = Color3.fromRGB(36, 42, 58),
+            BorderSizePixel = 0,
+        }, card)
+        Corner(track, 3)
+
+        local fill = MI("Frame", {
+            Size = UDim2.new((val - minVal) / (maxVal - minVal), 0, 1, 0),
+            BackgroundColor3 = THEME.Accent,
+            BorderSizePixel = 0,
+        }, track)
+        Corner(fill, 3)
 
         local thumb = MI("Frame", {
-            Size = UDim2.new(0, 16, 0, 16), AnchorPoint = Vector2.new(0.5, 0.5),
+            Size = UDim2.new(0, 14, 0, 14),
+            AnchorPoint = Vector2.new(0.5, 0.5),
             Position = UDim2.new((val - minVal) / (maxVal - minVal), 0, 0.5, 0),
-            BackgroundColor3 = Color3.fromRGB(255, 255, 255), BorderSizePixel = 0, ZIndex = 3,
+            BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+            BorderSizePixel = 0,
+            ZIndex = 3,
         }, track)
-        Corner(thumb, 8)
+        Corner(thumb, 7)
+        Stroke(thumb, THEME.Accent, 1.5)
 
-        local hitArea = MI("TextButton", { Size = UDim2.new(1, 0, 0, 30), Position = UDim2.new(0, 0, 0, -11), BackgroundTransparency = 1, Text = "", ZIndex = 10 }, track)
+        local hitArea = MI("TextButton", {
+            Size = UDim2.new(1, 0, 0, 26),
+            Position = UDim2.new(0, 0, 0, -10),
+            BackgroundTransparency = 1,
+            Text = "",
+            ZIndex = 5,
+        }, track)
+
         local sliding = false
-        local function Update(ix)
-            local t = math.clamp((ix - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+        local function UpdateSlider(xPos)
+            local t = math.clamp((xPos - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
             local step = (maxVal - minVal) <= 10 and 0.1 or 1
             val = math.floor((minVal + (maxVal - minVal) * t) / step + 0.5) * step
             val = math.clamp(val, minVal, maxVal)
             fill.Size = UDim2.new(t, 0, 1, 0)
             thumb.Position = UDim2.new(t, 0, 0.5, 0)
-            valLbl.Text = tostring(Round(val, 1)) .. suffix
+            valBadge.Text = tostring(Round(val, 1)) .. suffix
             pcall(callback, val)
         end
 
         hitArea.InputBegan:Connect(function(i)
             if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-                sliding = true; Update(i.Position.X)
+                sliding = true
+                UpdateSlider(i.Position.X)
             end
         end)
         UserInputService.InputEnded:Connect(function(i)
@@ -1008,75 +1499,117 @@ local function CreateTab(name, icon)
         end)
         UserInputService.InputChanged:Connect(function(i)
             if sliding and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
-                Update(i.Position.X)
+                UpdateSlider(i.Position.X)
             end
         end)
-
-        self.totalH = self.totalH + rowH + 8
-        self.page.CanvasSize = UDim2.new(0, 0, 0, self.totalH + 60)
     end
 
+    -- Modern Buton (Aksiyon Butonu)
     function tabObj:AddButton(title, callback)
-        local rowH = IS_MOBILE and 40 or 34
         local btn = MI("TextButton", {
-            Size = UDim2.new(1, 0, 0, rowH), BackgroundColor3 = THEME.Accent,
-            BackgroundTransparency = 0.25, Text = title, TextColor3 = THEME.TextMain,
-            Font = Enum.Font.GothamBold, TextSize = IS_MOBILE and 13 or 12,
-            BorderSizePixel = 0, AutoButtonColor = false,
+            Size = UDim2.new(1, 0, 0, IS_MOBILE and 38 or 34),
+            BackgroundColor3 = THEME.Surface,
+            Text = title,
+            TextColor3 = THEME.TextMain,
+            Font = Enum.Font.GothamBold,
+            TextSize = IS_MOBILE and 12 or 11,
+            BorderSizePixel = 0,
+            AutoButtonColor = false,
         }, self.page)
-        Corner(btn, 6)
-        btn.MouseButton1Click:Connect(function() pcall(callback) end)
-        self.totalH = self.totalH + rowH + 8
-        self.page.CanvasSize = UDim2.new(0, 0, 0, self.totalH + 60)
+        Corner(btn, 8)
+        Stroke(btn, THEME.Accent, 1, 0.4)
+
+        btn.MouseEnter:Connect(function()
+            TweenService:Create(btn, TweenInfo.new(0.15), { BackgroundColor3 = THEME.SurfaceHover }):Play()
+        end)
+        btn.MouseLeave:Connect(function()
+            TweenService:Create(btn, TweenInfo.new(0.15), { BackgroundColor3 = THEME.Surface }):Play()
+        end)
+        btn.MouseButton1Click:Connect(function()
+            -- Tıklama efekti
+            TweenService:Create(btn, TweenInfo.new(0.08), { TextColor3 = THEME.Accent }):Play()
+            task.delay(0.12, function()
+                TweenService:Create(btn, TweenInfo.new(0.1), { TextColor3 = THEME.TextMain }):Play()
+            end)
+            pcall(callback)
+        end)
     end
 
+    -- Modern Dropdown (Açılır Seçim)
     function tabObj:AddDropdown(title, options, defaultVal, callback)
         local sel = defaultVal or options[1]
-        local rowH = IS_MOBILE and 42 or 36
-        local row = MI("Frame", { Size = UDim2.new(1, 0, 0, rowH), BackgroundColor3 = THEME.SurfaceAlt, BorderSizePixel = 0, ZIndex = 5 }, self.page)
-        Corner(row, 6)
-        Padding(row, 0, 0, 10, 10)
+        local cardH = IS_MOBILE and 40 or 36
+        local card = MI("Frame", {
+            Size = UDim2.new(1, 0, 0, cardH),
+            BackgroundColor3 = THEME.Surface,
+            BorderSizePixel = 0,
+            ZIndex = 10,
+        }, self.page)
+        Corner(card, 8)
+        Stroke(card, THEME.Border, 1)
+        Padding(card, 0, 0, 12, 12)
 
         MI("TextLabel", {
-            Size = UDim2.new(0.55, 0, 1, 0), BackgroundTransparency = 1,
-            Text = title, TextColor3 = THEME.TextMain, Font = Enum.Font.GothamBold,
-            TextSize = IS_MOBILE and 13 or 12, TextXAlignment = Enum.TextXAlignment.Left,
-        }, row)
+            Size = UDim2.new(0.55, 0, 1, 0),
+            BackgroundTransparency = 1,
+            Text = title,
+            TextColor3 = THEME.TextMain,
+            Font = Enum.Font.GothamBold,
+            TextSize = IS_MOBILE and 12 or 11,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            ZIndex = 10,
+        }, card)
 
         local curLbl = MI("TextLabel", {
-            Size = UDim2.new(0.45, 0, 1, 0), Position = UDim2.new(0.55, 0, 0, 0),
-            BackgroundTransparency = 1, Text = "▼ " .. tostring(sel),
-            TextColor3 = THEME.AccentGlow, Font = Enum.Font.GothamBold,
-            TextSize = IS_MOBILE and 12 or 11, TextXAlignment = Enum.TextXAlignment.Right,
-        }, row)
+            Size = UDim2.new(0.45, 0, 1, 0),
+            Position = UDim2.new(0.55, 0, 0, 0),
+            BackgroundTransparency = 1,
+            Text = tostring(sel) .. " ▾",
+            TextColor3 = THEME.Accent,
+            Font = Enum.Font.GothamBold,
+            TextSize = IS_MOBILE and 12 or 11,
+            TextXAlignment = Enum.TextXAlignment.Right,
+            ZIndex = 10,
+        }, card)
 
         local dropPanel = MI("Frame", {
-            Size = UDim2.new(1, 0, 0, #options * 30 + 8), Position = UDim2.new(0, 0, 1, 4),
-            BackgroundColor3 = THEME.Surface, BorderSizePixel = 0, ZIndex = 20, Visible = false,
-        }, row)
-        Corner(dropPanel, 6)
-        MI("UIStroke", { Color = THEME.Border, Thickness = 1 }, dropPanel)
-        Padding(dropPanel, 4, 4, 4, 4)
+            Size = UDim2.new(1, 0, 0, #options * 28 + 6),
+            Position = UDim2.new(0, 0, 1, 4),
+            BackgroundColor3 = THEME.Sidebar,
+            BorderSizePixel = 0,
+            ZIndex = 30,
+            Visible = false,
+        }, card)
+        Corner(dropPanel, 8)
+        Stroke(dropPanel, THEME.Accent, 1, 0.2)
+        Padding(dropPanel, 3, 3, 4, 4)
         MI("UIListLayout", { FillDirection = Enum.FillDirection.Vertical, Padding = UDim.new(0, 2) }, dropPanel)
 
         for _, opt in ipairs(options) do
             local ob = MI("TextButton", {
-                Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = THEME.SurfaceAlt,
-                BackgroundTransparency = 0.5, Text = tostring(opt), TextColor3 = THEME.TextSub,
-                Font = Enum.Font.GothamBold, TextSize = 11, BorderSizePixel = 0, ZIndex = 21,
+                Size = UDim2.new(1, 0, 0, 26),
+                BackgroundColor3 = THEME.Surface,
+                BackgroundTransparency = 0.6,
+                Text = tostring(opt),
+                TextColor3 = THEME.TextSub,
+                Font = Enum.Font.GothamBold,
+                TextSize = 11,
+                BorderSizePixel = 0,
+                ZIndex = 31,
             }, dropPanel)
-            Corner(ob, 4)
+            Corner(ob, 5)
             ob.MouseButton1Click:Connect(function()
-                sel = opt; curLbl.Text = "▼ " .. tostring(opt)
-                dropPanel.Visible = false; pcall(callback, opt)
+                sel = opt
+                curLbl.Text = tostring(opt) .. " ▾"
+                dropPanel.Visible = false
+                pcall(callback, opt)
             end)
         end
 
-        local toggleDrop = MI("TextButton", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 6 }, row)
-        toggleDrop.MouseButton1Click:Connect(function() dropPanel.Visible = not dropPanel.Visible end)
-
-        self.totalH = self.totalH + rowH + 8
-        self.page.CanvasSize = UDim2.new(0, 0, 0, self.totalH + 60)
+        local toggleBtn = MI("TextButton", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 12 }, card)
+        toggleBtn.MouseButton1Click:Connect(function()
+            dropPanel.Visible = not dropPanel.Visible
+        end)
     end
 
     Tabs[name] = tabObj
@@ -1085,66 +1618,66 @@ local function CreateTab(name, icon)
 end
 
 -- ===============================================================
--- 7. MENÜ ELEMANLARI
+-- 7. MENÜ SEKMELERİ VE ÖZELLİKLER (BY UMUT)
 -- ===============================================================
 
--- 1. COMBAT
+-- 1. COMBAT (TOP KORUMA & SAVUNMA)
 local tCombat = CreateTab("Combat", "⚔️")
-tCombat:AddSection("🛡️ Top Koruma (Anti-Steal)")
-tCombat:AddToggle("Anti-Steal Auto Feint", Config.Combat.AntiStealFeint, function(v) Config.Combat.AntiStealFeint = v end, "Top sendeyken rakip yaklasinca otomatik Feint")
-tCombat:AddToggle("Auto Parry", Config.Combat.AutoParry, function(v) Config.Combat.AutoParry = v end, "Rakip vurus/kayma animasyonunda Feint")
+tCombat:AddSection("🛡️ Top Koruma & Kaybetmeme (By Umut)")
+tCombat:AddToggle("Top Kaybetmeme (Anti-Steal)", Config.Combat.AntiStealFeint, function(v) Config.Combat.AntiStealFeint = v end, "Topu ters tarafa saklar, calim basar ve sendelemeyi engeller")
+tCombat:AddToggle("Auto Parry", Config.Combat.AutoParry, function(v) Config.Combat.AutoParry = v end, "Rakip vurma/kayma baslatinca aninda karsilik verir")
 tCombat:AddSlider("Parry Menzili", 4, 25, Config.Combat.AutoParryRadius, function(v) Config.Combat.AutoParryRadius = v end, " st")
 
-tCombat:AddSection("🏃 Tackle & KO")
-tCombat:AddToggle("Auto Tackle", Config.Combat.AutoTackle, function(v) Config.Combat.AutoTackle = v end, "Top rakipteyken otomatik kay")
+tCombat:AddSection("🏃 Tackle & Knockout")
+tCombat:AddToggle("Auto Tackle", Config.Combat.AutoTackle, function(v) Config.Combat.AutoTackle = v end, "Top rakipteyken hedefe otomatik kay")
 tCombat:AddSlider("Tackle Menzili", 4, 25, Config.Combat.TackleRange, function(v) Config.Combat.TackleRange = v end, " st")
-tCombat:AddToggle("Auto Knockout", Config.Combat.AutoKnockout, function(v) Config.Combat.AutoKnockout = v end, "Menzildeki rakibe yumruk spamla")
+tCombat:AddToggle("Auto Knockout", Config.Combat.AutoKnockout, function(v) Config.Combat.AutoKnockout = v end, "Menzildeki rakibe araliksiz yumruk bas")
 tCombat:AddSlider("KO Menzili", 3, 18, Config.Combat.KORange, function(v) Config.Combat.KORange = v end, " st")
 
--- 2. BALL / GOAL
+-- 2. BALL (TOPU ÇEKME & ŞUT)
 local tBall = CreateTab("Ball", "⚽")
+tBall:AddSection("🧲 Topu Ayağa Çekme (Magnet Reach)")
+tBall:AddToggle("Topu Ayağa Çek (Magnet)", Config.Ball.MagnetReach, function(v) Config.Ball.MagnetReach = v end, "Karakter isinlanmaz! Top dogrudan ayagina cekilir ve calinir")
+tBall:AddSlider("Çekme Menzili", 5, 50, Config.Ball.ReachRadius, function(v) Config.Ball.ReachRadius = v end, " st")
+
 tBall:AddSection("🎯 Şut Yönlendirme (Silent Aim)")
-tBall:AddToggle("Silent Aim", Config.Ball.SilentAim, function(v) Config.Ball.SilentAim = v end, "Sut cekince top kalenin kosesine gider")
+tBall:AddToggle("Silent Aim", Config.Ball.SilentAim, function(v) Config.Ball.SilentAim = v end, "Sut vurunca top dogrudan secilen kale kosesine gider")
 tBall:AddDropdown("Hedef Köşe", { "BottomLeft", "BottomRight", "TopLeft", "TopRight", "Center" }, Config.Ball.SilentAimCorner, function(v) Config.Ball.SilentAimCorner = v end)
 tBall:AddSlider("Aim Gücü", 0.2, 1.0, Config.Ball.SilentAimStrength, function(v) Config.Ball.SilentAimStrength = v end, "x")
 tBall:AddButton("⚽ Manuel Aim Uygula", function() pcall(ApplySilentAim) end)
 
-tBall:AddSection("🧲 Top Mıknatısı (Real Touch Reach)")
-tBall:AddToggle("Magnet Reach", Config.Ball.MagnetReach, function(v) Config.Ball.MagnetReach = v end, "Menzildeki topu fiziksel olarak ayagina alir")
-tBall:AddSlider("Reach Menzili", 5, 45, Config.Ball.ReachRadius, function(v) Config.Ball.ReachRadius = v end, " st")
-
--- 3. ESP
+-- 3. ESP (GÖRSEL ANALİZ)
 local tESP = CreateTab("ESP", "👁️")
 tESP:AddSection("👁️ Görsel Analiz (ESP)")
-tESP:AddToggle("Oyuncu ESP (Duvar Arkası)", Config.ESP.PlayerESP, function(v) Config.ESP.PlayerESP = v end, "Rakipleri duvar arkasindan parlatir ve mesafeyi yazar")
-tESP:AddToggle("Kutu / Sandık ESP", Config.ESP.BoxESP, function(v) Config.ESP.BoxESP = v end, "Sahadaki esya kutularini gosterir")
-tESP:AddToggle("Top Yörünge Çizgisi", Config.ESP.BallTrajectory, function(v) Config.ESP.BallTrajectory = v end, "Topun ucacagi ve dusecegi yeri 3D cizer")
+tESP:AddToggle("Oyuncu ESP (Duvar Arkası)", Config.ESP.PlayerESP, function(v) Config.ESP.PlayerESP = v end, "Rakipleri duvar arkasindan parlatir ve mesafeyi gosterir")
+tESP:AddToggle("Kutu / Sandık ESP", Config.ESP.BoxESP, function(v) Config.ESP.BoxESP = v end, "Sahadaki sans kutularini parlatir")
+tESP:AddToggle("Top Yörünge Çizgisi", Config.ESP.BallTrajectory, function(v) Config.ESP.BallTrajectory = v end, "Topun gidecegi yolu 3D cizer")
 tESP:AddSlider("ESP Görüş Menzili", 50, 400, Config.ESP.ESPMaxDistance, function(v) Config.ESP.ESPMaxDistance = v end, " st")
 
--- 4. ITEMS
+-- 4. ITEMS (EŞYA OTOMASYONU)
 local tItems = CreateTab("Items", "📦")
 tItems:AddSection("📦 Kutu Mıknatısı / Teleport")
-tItems:AddToggle("Kutu Auto-Collect", Config.Items.BoxTeleport, function(v) Config.Items.BoxTeleport = v end, "Sahadaki kutulara otomatik gider")
+tItems:AddToggle("Kutu Auto-Collect", Config.Items.BoxTeleport, function(v) Config.Items.BoxTeleport = v end, "Sahadaki kutulara otomatik ulasir")
 tItems:AddDropdown("Toplama Modu", { "Teleport", "Pull" }, Config.Items.BoxPullMode, function(v) Config.Items.BoxPullMode = v end)
 tItems:AddSlider("Tarama Aralığı", 0.2, 3.0, Config.Items.BoxScanInterval, function(v) Config.Items.BoxScanInterval = v end, "s")
 
--- 5. MOVEMENT
+-- 5. MOVEMENT (HAREKET & BOOST)
 local tMove = CreateTab("Move", "🏃")
 tMove:AddSection("⚡ Hız & Zıplama")
 tMove:AddToggle("Speed Hack", Config.Movement.SpeedHack, function(v) Config.Movement.SpeedHack = v end)
-tMove:AddSlider("Yürüme Hızı", 16, 100, Config.Movement.WalkSpeed, function(v) Config.Movement.WalkSpeed = v end, " ws")
+tMove:AddSlider("Yürüme Hızı", 16, 120, Config.Movement.WalkSpeed, function(v) Config.Movement.WalkSpeed = v end, " ws")
 tMove:AddToggle("Jump Power", Config.Movement.JumpPower, function(v) Config.Movement.JumpPower = v end)
-tMove:AddSlider("Zıplama Yüksekliği", 7, 150, Config.Movement.JumpHeight, function(v) Config.Movement.JumpHeight = v end, " st")
+tMove:AddSlider("Zıplama Yüksekliği", 7, 160, Config.Movement.JumpHeight, function(v) Config.Movement.JumpHeight = v end, " st")
 
-tMove:AddSection("💨 Kayma Boost (Slide Boost)")
-tMove:AddToggle("Kayma Hızlandırma", Config.Movement.SlideBoost, function(v) Config.Movement.SlideBoost = v end, "Sadece kayarken ekstra ileri ivme verir")
+tMove:AddSection("💨 Kayma Hızlandırma (Slide Boost)")
+tMove:AddToggle("Kayma Boost", Config.Movement.SlideBoost, function(v) Config.Movement.SlideBoost = v end, "Sadece kayarken ileriye ekstra hiz patlamasi verir")
 tMove:AddSlider("Slide Çarpanı", 1.0, 6.0, Config.Movement.SlideMultiplier, function(v) Config.Movement.SlideMultiplier = v end, "x")
 tMove:AddButton("💨 Anlık Slide Boost Bas", function() TriggerSlideBoost() end)
 
--- Varsayilan acilis22:46 7.09.2026
+-- Varsayılan Sekme
 SelectTab("Combat")
 
--- Temizlik
+-- Temizlik Fonksiyonu
 local function FullCleanup()
     DisconnectAll()
     pcall(function() guiRoot:Destroy() end)
@@ -1152,7 +1685,7 @@ local function FullCleanup()
     pcall(function() _trajFolder:Destroy() end)
     local hum = GetHum()
     if hum then hum.WalkSpeed = 16; hum.JumpHeight = 7.2 end
-    print("[FutbolUmsu v2.0] Kapatildi.")
+    print("[FutbolUmsu • By Umut] Kapatildi.")
 end
 
 if getgenv then
@@ -1162,6 +1695,6 @@ if getgenv then
 end
 
 print("=================================================")
-print("  ⚽ FutbolUmsu v2.0 Başarıyla Yüklendi!")
+print("  ⚽ FutbolUmsu v2.5 (By Umut) Başarıyla Yüklendi!")
 print("  📱 Sol taraftaki ⚽ butonuna basarak aç/kapat!")
 print("=================================================")
