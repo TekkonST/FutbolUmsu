@@ -96,13 +96,13 @@ local Config = {
         SlideMultiplier  = 3.5,
     },
     GK = {
-        AutoDive         = false,   -- Otomatik kaleci atlayisi
+        AutoDive         = true,    -- Otomatik kaleci atlayisi (varsayilan acik)
         SmartThreatOnly  = true,    -- Sadece kaleye gelen gercek sutlara atla (paslari ve autu eler)
         PerfectCatch     = true,    -- Kesin top tutma / kacirmama (Touch & Catch kilidi)
-        DiveRange        = 42,      -- Algilama menzili (studs)
-        MinShotSpeed     = 25,      -- Sut hiz esigi (bu hiz altindaki yavas paslara atlamaz)
-        TimeToGoalMax    = 0.8,     -- En fazla kac saniye kala atlasin
-        TimeToGoalMin    = 0.12,    -- Cok gec kalmamak icin alt sinir
+        DiveRange        = 48,      -- Algilama menzili (studs)
+        MinShotSpeed     = 16,      -- Sut hiz esigi (bu hiz altindaki yavas paslara atlamaz)
+        TimeToGoalMax    = 1.3,     -- En fazla kac saniye kala atlasin
+        TimeToGoalMin    = 0.05,    -- Cok gec kalmamak icin alt sinir
         BoostPhysical    = true,    -- Sıçramaya ek ivme desteği
     },
 }
@@ -373,113 +373,274 @@ local function GetGoalCorner(cornerName)
     return (cf * CFrame.new(off)).Position
 end
 
--- Korudugumuz Kaleyi Bul (Kaleciye En Yakin Kale)
+-- Korudugumuz Kaleyi Bul (Kaleciye En Yakin Kale veya Bulunamazsa Kalecinin Mevcut Konumu)
 local function GetMyGoal()
     local root = GetRoot()
     if not root then return nil, math.huge end
     local goals = {}
     for _, v in ipairs(workspace:GetDescendants()) do
-        if v:IsA("BasePart") and v.Size.X > 5 then
+        if v:IsA("BasePart") and (v.Size.X > 4 or v.Size.Z > 4) then
             local n = v.Name:lower()
-            if n:find("goal") or n:find("kale") or n:find("net") or n:find("post") then
+            if n:find("goal") or n:find("kale") or n:find("net") or n:find("post") or n:find("direk") then
                 table.insert(goals, v)
             end
         end
     end
-    if #goals == 0 then return nil, math.huge end
 
-    local closest, minD = nil, math.huge
-    for _, g in ipairs(goals) do
-        local d = (root.Position - g.Position).Magnitude
-        if d < minD then
-            minD = d
-            closest = g
+    if #goals > 0 then
+        local closest, minD = nil, math.huge
+        for _, g in ipairs(goals) do
+            local d = (root.Position - g.Position).Magnitude
+            if d < minD then
+                minD = d
+                closest = g
+            end
         end
+        return closest, minD
     end
-    return closest, minD
+
+    -- Eger sahadaki kale bulunamazsa, kalecinin mevcut konumunu referans al
+    return root, 0
 end
 
--- Oyundaki Kaleci Planjon / Sicrama Butonunu Bul ve Tikla (Mobil & PC)
-local function PressInGameDiveButton()
-    local triggered = false
+-- Bildirim Gönderme Yardımcısı
+local function GKNotify(title, text)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "🧤 " .. title,
+            Text = text,
+            Duration = 3,
+        })
+    end)
+    print("[FutbolUmsu GK] " .. title .. ": " .. text)
+end
 
-    -- 1. PlayerGui altindaki 'Planjon' butonunu tara ve her turlu sinyalle tetikle
+-- Oyundaki Planjon Butonu Referansi (Onbellek)
+local _customPlanjonBtn = nil
+local _isPickingPlanjon = false
+
+-- Planjon Butonu Adayı mı? (Genişletilmiş Filtre)
+local function IsPlanjonCandidate(obj)
+    if not obj or not obj:IsA("GuiObject") then return false end
+    if guiRoot and obj:IsDescendantOf(guiRoot) then return false end
+
+    local name = obj.Name:lower()
+    local parentName = (obj.Parent and obj.Parent.Name or ""):lower()
+    local text = ""
+
+    if obj:IsA("TextButton") or obj:IsA("TextLabel") then
+        text = text .. " " .. obj.Text:lower()
+    end
+    for _, ch in ipairs(obj:GetDescendants()) do
+        if ch:IsA("TextLabel") or ch:IsA("TextButton") then
+            text = text .. " " .. ch.Text:lower()
+        end
+    end
+
+    -- 1. Kesin Eşleşmeler (Türkçe & İngilizce)
+    if text:find("planjon") or name:find("planjon") or parentName:find("planjon") then
+        return true, 100, "Planjon"
+    end
+    if text:find("plongeon") or name:find("plongeon") then
+        return true, 95, "Plongeon"
+    end
+    if text:find("dive") or name:find("dive") or parentName:find("dive") then
+        return true, 90, "Dive"
+    end
+    if text:find("kurtar") or name:find("kurtar") then
+        return true, 85, "Kurtar"
+    end
+    if (text:find("uç") or text:find("uc") or text:find("atla")) and not text:find("kay") then
+        return true, 80, "Uç/Atla"
+    end
+    if name:find("gkdive") or name:find("keeperdive") or text:find("keeper") or text:find("goalie") then
+        return true, 75, "GK Dive"
+    end
+
+    return false, 0, ""
+end
+
+-- Otomatik Planjon Butonu Bulucu
+local function FindPlanjonButton()
+    if _customPlanjonBtn and _customPlanjonBtn.Parent then
+        return _customPlanjonBtn
+    end
+
     local pgui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if pgui then
-        for _, btn in ipairs(pgui:GetDescendants()) do
-            if btn:IsA("GuiButton") and btn.Visible then
-                local n = btn.Name:lower()
-                local p = btn.Parent and btn.Parent.Name:lower() or ""
+    if not pgui then return nil end
 
-                -- Buton text veya child label text taramasi
-                local btnTxt = ""
-                if btn:IsA("TextButton") then btnTxt = btn.Text:lower() end
-                for _, ch in ipairs(btn:GetChildren()) do
-                    if ch:IsA("TextLabel") then
-                        btnTxt = btnTxt .. " " .. ch.Text:lower()
-                    end
-                end
+    -- 1. ContextActionGui kontrolu (ContextActionService mobil butonlari)
+    local casGui = pgui:FindFirstChild("ContextActionGui")
+    if casGui then
+        for _, d in ipairs(casGui:GetDescendants()) do
+            local isMatch = IsPlanjonCandidate(d)
+            if isMatch then
+                _customPlanjonBtn = d
+                return d
+            end
+        end
+    end
 
-                -- 'Planjon' oncelikli arama
-                local isPlanjon = n:find("planjon") or p:find("planjon") or btnTxt:find("planjon")
-                                  or n:find("plongeon") or btnTxt:find("plongeon")
-                local isGK = n:find("dive") or n:find("gk") or n:find("keeper") or n:find("save") or n:find("leap")
+    -- 2. PlayerGui icindeki tum GUI objelerinde tarama
+    local candidates = {}
+    for _, obj in ipairs(pgui:GetDescendants()) do
+        if obj:IsA("GuiObject") and obj.Visible ~= false then
+            local isMatch, score, matchName = IsPlanjonCandidate(obj)
+            if isMatch then
+                table.insert(candidates, { score = score, elem = obj, matchName = matchName })
+            end
+        end
+    end
 
-                if isPlanjon or isGK then
+    if #candidates > 0 then
+        table.sort(candidates, function(a, b) return a.score > b.score end)
+        _customPlanjonBtn = candidates[1].elem
+        return candidates[1].elem
+    end
+
+    return nil
+end
+
+-- Buton Tetikleme (Multi-Method: getconnections + firesignal + VirtualInputManager + Touch)
+local function TriggerPlanjonElement(elem)
+    if not elem or not elem:IsA("GuiObject") then return false end
+    local triggered = false
+    local vim = game:GetService("VirtualInputManager")
+
+    -- 1. getconnections ile oyundaki bagli tum event fonksiyonlarini dogrudan calistir
+    if getconnections then
+        local signals = { "MouseButton1Down", "MouseButton1Click", "MouseButton1Up", "Activated", "TouchTap", "InputBegan" }
+        for _, sigName in ipairs(signals) do
+            local sig = elem[sigName]
+            if sig then
+                for _, conn in ipairs(getconnections(sig)) do
                     pcall(function()
-                        if firesignal then
-                            firesignal(btn.MouseButton1Down)
-                            firesignal(btn.MouseButton1Click)
-                            firesignal(btn.MouseButton1Up)
-                            firesignal(btn.Activated)
-                            firesignal(btn.TouchTap)
+                        if sigName == "InputBegan" then
+                            conn:Fire({
+                                UserInputType = Enum.UserInputType.Touch,
+                                UserInputState = Enum.UserInputState.Begin,
+                                Position = Vector3.new(elem.AbsolutePosition.X + elem.AbsoluteSize.X / 2, elem.AbsolutePosition.Y + elem.AbsoluteSize.Y / 2, 0)
+                            })
+                        else
+                            conn:Fire()
                         end
-                        if btn.Activate then btn:Activate() end
+                        triggered = true
                     end)
-                    triggered = true
-                    if isPlanjon then break end
                 end
             end
         end
     end
 
-    -- 2. ContextActionService uzerinden 'Planjon' tetikle
+    -- 2. firesignal cagrilari
+    if firesignal then
+        pcall(function()
+            if elem.MouseButton1Down then firesignal(elem.MouseButton1Down) end
+            if elem.MouseButton1Click then firesignal(elem.MouseButton1Click) end
+            if elem.Activated then firesignal(elem.Activated) end
+            if elem.TouchTap then firesignal(elem.TouchTap) end
+            if elem.MouseButton1Up then firesignal(elem.MouseButton1Up) end
+            if elem.InputBegan then
+                firesignal(elem.InputBegan, {
+                    UserInputType = Enum.UserInputType.Touch,
+                    UserInputState = Enum.UserInputState.Begin,
+                    Position = Vector3.new(elem.AbsolutePosition.X + elem.AbsoluteSize.X / 2, elem.AbsolutePosition.Y + elem.AbsoluteSize.Y / 2, 0)
+                })
+            end
+            triggered = true
+        end)
+    end
+
+    -- 3. GuiButton :Activate()
+    if elem:IsA("GuiButton") and elem.Activate then
+        pcall(function() elem:Activate(); triggered = true end)
+    end
+
+    -- 4. VirtualInputManager (Fare & Mobil Dokunma)
+    if vim and elem.AbsoluteSize.X > 2 and elem.AbsoluteSize.Y > 2 then
+        local cx = elem.AbsolutePosition.X + elem.AbsoluteSize.X / 2
+        local cy = elem.AbsolutePosition.Y + elem.AbsoluteSize.Y / 2
+        pcall(function()
+            vim:SendMouseButtonEvent(cx, cy, 0, true, game, 1)
+            task.delay(0.02, function()
+                pcall(function() vim:SendMouseButtonEvent(cx, cy, 0, false, game, 1) end)
+            end)
+        end)
+        pcall(function()
+            vim:SendTouchEvent(1, 0, cx, cy)
+            task.delay(0.02, function()
+                pcall(function() vim:SendTouchEvent(1, 2, cx, cy) end)
+            end)
+        end)
+        triggered = true
+    end
+
+    return triggered
+end
+
+-- Oyundaki Kaleci Planjon Butonunu Bul ve Eksiksiz Tetikle
+local function PressInGameDiveButton(showNotification)
+    local triggered = false
+    local targetBtn = FindPlanjonButton()
+
+    if targetBtn then
+        TriggerPlanjonElement(targetBtn)
+        triggered = true
+        if showNotification then
+            GKNotify("Planjon Basıldı", "Bulunan Buton: " .. targetBtn.Name .. " (" .. (targetBtn:IsA("TextButton") and targetBtn.Text or "GUI") .. ")")
+        end
+    elseif showNotification then
+        GKNotify("Buton Aranıyor", "Planjon butonu henüz bulunamadı! 'Butona Dokunarak Tanıt' seçeneğini kullanabilirsiniz.")
+    end
+
+    -- C) ContextActionService Action'larini tetikle (Tüm olası aksiyon isimleri)
     pcall(function()
         local cas = game:GetService("ContextActionService")
-        cas:CallFunction("Planjon", Enum.UserInputState.Begin, nil)
-        cas:CallFunction("planjon", Enum.UserInputState.Begin, nil)
-        cas:CallFunction("Dive", Enum.UserInputState.Begin, nil)
+        local actionNames = {
+            "Planjon", "planjon", "PLANJON", "Plongeon", "plongeon",
+            "Dive", "dive", "DIVE", "GK_Dive", "GoalieDive", "KeeperDive",
+            "Catch", "Save", "Atla", "Jump", "MobileDive"
+        }
+        for _, act in ipairs(actionNames) do
+            pcall(cas.CallFunction, cas, act, Enum.UserInputState.Begin, nil)
+            task.delay(0.02, function()
+                pcall(cas.CallFunction, cas, act, Enum.UserInputState.End, nil)
+            end)
+        end
     end)
 
-    -- 3. Remote Event / Function ile dogrudan 'Planjon' ateşle
+    -- D) Remote Event / Remote Function cagrilari
     local diveRemotes = {
         "Planjon", "planjon", "PlanjonAction", "PlanjonEvent", "PlanjonRemote", "GKPlanjon",
-        "GKDive", "Dive", "KeeperDive", "GK_Dive", "Save", "GoalieDive",
-        "KeeperSave", "Catch", "MobileDive", "Leap", "GKJump"
+        "GKDive", "Dive", "dive", "KeeperDive", "GK_Dive", "Save", "save", "GoalieDive",
+        "KeeperSave", "Catch", "catch", "MobileDive", "Leap", "GKJump"
     }
     if SafeFireAny(diveRemotes) then
         triggered = true
     end
 
-    -- 4. Tus simulasyonu (PC / Emulator desteği: E tuşu ve Space)
-    pcall(function()
-        local vim = game:GetService("VirtualInputManager")
-        if vim then
-            -- E tusu (Planjon)
-            vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-            vim:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+    -- E) Virtual Klavye Tuşları (E, Q, Space, F)
+    local vim = game:GetService("VirtualInputManager")
+    if vim then
+        pcall(function()
+            local keys = { Enum.KeyCode.E, Enum.KeyCode.Space, Enum.KeyCode.Q, Enum.KeyCode.F }
+            for _, k in ipairs(keys) do
+                vim:SendKeyEvent(true, k, false, game)
+            end
             task.delay(0.04, function()
-                vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-                vim:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+                pcall(function()
+                    for _, k in ipairs(keys) do
+                        vim:SendKeyEvent(false, k, false, game)
+                    end
+                end)
             end)
-        end
-    end)
+        end)
+    end
 
     return triggered
 end
 
 -- ===============================================================
--- 🧤 GELISMIS AKILLI KALECI YAPAY ZEKASI (PLANJON AUTO-DIVE)
+-- 🧤 GELİŞMİŞ AKILLI KALECİ YAPAY ZEKASI (PLANJON AUTO-DIVE)
 -- ===============================================================
 local _lastDiveTime = 0
 
@@ -500,10 +661,10 @@ local function RunGoalkeeperAI()
 
     -- Korudugumuz kaleyi bul
     local myGoal, distToGoal = GetMyGoal()
-    if not myGoal then return end
+    if not myGoal then myGoal = myRoot; distToGoal = 0 end
 
-    -- Kaleci kalesine yakin mi? (55 stud icinde olmali)
-    if distToGoal > 55 then return end
+    -- Kaleci kalesinden çok uzakta değilse aktif olsun
+    if distToGoal > 110 and myGoal ~= myRoot then return end
 
     local ballPos = ball.Position
     local ballVel = ball.AssemblyLinearVelocity or Vector3.new(0, 0, 0)
@@ -524,17 +685,17 @@ local function RunGoalkeeperAI()
     local dotMe = ballVel.Unit:Dot(toMe)
     local dotGoal = ballVel.Unit:Dot(toGoal)
 
-    -- Top bizden veya kaleden uzaklasiyorsa ya da yan pas ise atlama!
-    if dotMe < 0.22 and dotGoal < 0.22 then
+    -- Top bizden veya kaleden tamamen uzaklasiyorsa atlama
+    if Config.GK.SmartThreatOnly and dotMe < 0.08 and dotGoal < 0.08 then
         return
     end
 
     -- 3. ZAMANLAMA VE HEDEF KESISME HESABI (Time to Impact)
-    local closingSpeed = math.max(ballVel:Dot(toMe), 15)
+    local closingSpeed = math.max(ballVel:Dot(toMe), 14)
     local timeToArrive = distToMe / closingSpeed
 
-    -- Atlama zaman penceresi (Ne cok erken ne cok gec)
-    if timeToArrive < Config.GK.TimeToGoalMin or timeToArrive > Config.GK.TimeToGoalMax then
+    -- Atlama zaman penceresi
+    if Config.GK.SmartThreatOnly and (timeToArrive < Config.GK.TimeToGoalMin or timeToArrive > Config.GK.TimeToGoalMax) then
         return
     end
 
@@ -542,20 +703,20 @@ local function RunGoalkeeperAI()
     local g = -workspace.Gravity
     local predictedBallPos = ballPos + (ballVel * timeToArrive) + Vector3.new(0, 0.5 * g * (timeToArrive ^ 2), 0)
 
-    -- 4. AUT VE TAC FILTRESI (Kalenin disina giden toplara atlama)
-    if Config.GK.SmartThreatOnly then
+    -- 4. AUT VE TAC FILTRESI (Kalenin disina bariz giden toplara atlama)
+    if Config.GK.SmartThreatOnly and myGoal ~= myRoot then
         local goalSize = myGoal.Size
         local goalPos = myGoal.Position
         local offX = math.abs(predictedBallPos.X - goalPos.X)
         local offZ = math.abs(predictedBallPos.Z - goalPos.Z)
-        local maxHoriz = math.max(goalSize.X, goalSize.Z) * 0.9 + 6
+        local maxHoriz = math.max(goalSize.X, goalSize.Z) * 1.1 + 10
 
         if offX > maxHoriz and offZ > maxHoriz then
             return -- Auta gidiyor!
         end
 
         -- Diregin cok uzerinden ucuyorsa atlama
-        if (predictedBallPos.Y - goalPos.Y) > (goalSize.Y + 12) then
+        if (predictedBallPos.Y - goalPos.Y) > (goalSize.Y + 16) then
             return
         end
     end
@@ -568,37 +729,55 @@ local function RunGoalkeeperAI()
     -- Kaleci ile topun bulusacagi ideal kurtaris noktasi
     local interceptPos = myPos:Lerp(predictedBallPos, 0.65)
     local diveVec = (interceptPos - myPos)
-    local diveDir2D = Vector3.new(diveVec.X, 0, diveVec.Z).Unit
+    local diveDir2D = Vector3.new(diveVec.X, 0, diveVec.Z)
+    if diveDir2D.Magnitude > 0.05 then
+        diveDir2D = diveDir2D.Unit
+    else
+        diveDir2D = myRoot.CFrame.LookVector
+    end
 
-    -- A) Karakteri topun gelis yonune cevir
-    myRoot.CFrame = CFrame.new(myPos, myPos + diveDir2D)
+    -- A) Karakteri topun gelis yonune aninda cevir
+    pcall(function()
+        myRoot.CFrame = CFrame.lookAt(myPos, myPos + Vector3.new(diveDir2D.X, 0, diveDir2D.Z))
+    end)
 
-    -- B) YURUME YONUNU TOPA DOGRU BASLAT (Oyun yurudugun yone dogru planjon yaptigi icin!)
-    hum:Move(diveDir2D, false)
-    myRoot.AssemblyLinearVelocity = (diveDir2D * 26) + Vector3.new(0, 4, 0)
+    -- B) YÜRÜME YÖNÜNÜ KESİNTİSİZ TOPA DOĞRU TUT (Oyun yürüdüğün yöne doğru planjon yaptığı için!)
+    task.spawn(function()
+        local walkStart = tick()
+        while tick() - walkStart < 0.35 do
+            if not hum or not myRoot then break end
+            hum:Move(diveDir2D, false)
+            task.wait(0.02)
+        end
+    end)
 
-    -- C) Kisa milisaniye sonra PLANJON butonuna bas
-    task.wait(0.02)
-    PressInGameDiveButton()
+    -- C) PLANJON BUTONUNU SENKRONİZE VE SERİ ŞEKİLDE TETİKLE
+    task.spawn(function()
+        PressInGameDiveButton(false)
+        task.wait(0.03)
+        PressInGameDiveButton(false)
+        task.wait(0.05)
+        PressInGameDiveButton(false)
+    end)
 
-    -- D) Fiziksel sicrama ve ivme destegi (Topu havada yetisip kurtarmak icin)
+    -- D) Fiziksel sıçrama ve ivme desteği (Topu havada kesin karşılamak için)
     if Config.GK.BoostPhysical then
         hum.Jump = true
-        local verticalImpulse = math.clamp((interceptPos.Y - myPos.Y) * 11 + 16, 14, 36)
-        local leapSpeed = math.clamp(diveVec.Magnitude * 20, 28, 52)
+        local verticalImpulse = math.clamp((interceptPos.Y - myPos.Y) * 11 + 16, 14, 38)
+        local leapSpeed = math.clamp(diveVec.Magnitude * 20, 28, 55)
         myRoot.AssemblyLinearVelocity = (diveDir2D * leapSpeed) + Vector3.new(0, verticalImpulse, 0)
     end
 
-    -- E) KESIN TUTUS / TOPU YAKALAMA (100% Catch & Retention)
+    -- E) KESİN TUTUŞ / TOPU YAKALAMA (100% Catch & Retention)
     if Config.GK.PerfectCatch then
         task.spawn(function()
             local saveStart = tick()
-            while tick() - saveStart < 0.75 do
+            while tick() - saveStart < 0.85 do
                 task.wait(0.02)
                 if not ball or not myRoot then break end
 
                 local curDist = (myRoot.Position - ball.Position).Magnitude
-                if curDist <= 7.0 then
+                if curDist <= 8.0 then
                     -- Tum vucut ve kollar ile temas kur
                     local touchParts = {
                         char:FindFirstChild("RightHand") or char:FindFirstChild("Right Arm"),
@@ -617,7 +796,7 @@ local function RunGoalkeeperAI()
                     end
 
                     -- Topu kalecinin onunde kitle / ellerin arasina al
-                    if curDist <= 4.2 then
+                    if curDist <= 4.5 then
                         local handsPos = myRoot.Position + (myRoot.CFrame.LookVector * 1.5) + Vector3.new(0, 0.4, 0)
                         ball.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
                         ball.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
@@ -1931,17 +2110,85 @@ tGK:AddToggle("Sadece Şutlara Atla (Pas Filtresi)", Config.GK.SmartThreatOnly, 
 tGK:AddToggle("Kesin Top Tutma (100% Catch)", Config.GK.PerfectCatch, function(v) Config.GK.PerfectCatch = v end, "Top temas aninda ellerin arasinda kilitlenir, sekip gol olmaz")
 tGK:AddToggle("Fiziksel İvme Desteği", Config.GK.BoostPhysical, function(v) Config.GK.BoostPhysical = v end, "Topu havada yetisip cikarmak icin ekstra sicrama ivmesi verir")
 
-tGK:AddSection("⚙️ Kaleci İnce Ayarları")
-tGK:AddSlider("Şut Hız Eşiği (Pas Limiti)", 15, 55, Config.GK.MinShotSpeed, function(v) Config.GK.MinShotSpeed = v end, " spd")
-tGK:AddSlider("Kaleci Algılama Menzili", 15, 65, Config.GK.DiveRange, function(v) Config.GK.DiveRange = v end, " st")
-tGK:AddSlider("Atlama Zamanlaması", 0.3, 1.2, Config.GK.TimeToGoalMax, function(v) Config.GK.TimeToGoalMax = v end, " sn")
-tGK:AddButton("🧤 Manuel Topa Doğru Sıçra", function()
+tGK:AddSection("🎮 Planjon Buton Kontrolleri & Test")
+tGK:AddButton("🧤 Planjon Test Et (Şimdi Bas)", function()
+    PressInGameDiveButton(true)
+end)
+
+tGK:AddButton("🎯 Butona Dokunarak Tanıt (Seçici)", function()
+    _isPickingPlanjon = true
+    GKNotify("Seçici Aktif", "Lütfen oyundaki Planjon/Atlama butonuna EKRANDAN DOKUNUN!")
+    local pickerConn
+    pickerConn = UserInputService.InputBegan:Connect(function(input)
+        if not _isPickingPlanjon then
+            if pickerConn then pickerConn:Disconnect() end
+            return
+        end
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            _isPickingPlanjon = false
+            if pickerConn then pickerConn:Disconnect() end
+
+            local pgui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+            if not pgui then return end
+            local objs = pgui:GetGuiObjectsAtPosition(input.Position.X, input.Position.Y)
+            local selected = nil
+            for _, o in ipairs(objs) do
+                if guiRoot and not o:IsDescendantOf(guiRoot) then
+                    selected = o
+                    break
+                end
+            end
+            if selected then
+                _customPlanjonBtn = selected
+                GKNotify("Başarılı!", "Planjon butonu bağlandı: " .. selected.Name)
+                pcall(function()
+                    local s = Instance.new("UIStroke")
+                    s.Color = Color3.fromRGB(0, 255, 128)
+                    s.Thickness = 3
+                    s.Parent = selected
+                    task.delay(2, function() pcall(function() s:Destroy() end) end)
+                end)
+            else
+                GKNotify("Uyarı", "Geçerli buton bulunamadı, tekrar deneyin.")
+            end
+        end
+    end)
+end)
+
+tGK:AddButton("🔍 Ekrandaki Butonları Tara & Listele", function()
+    local pgui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not pgui then return end
+    local count = 0
+    print("================ [FUTBOLUMSU BUTON TARAMASI] ================")
+    for _, obj in ipairs(pgui:GetDescendants()) do
+        if obj:IsA("GuiObject") and (not guiRoot or not obj:IsDescendantOf(guiRoot)) and obj.Visible ~= false then
+            local txt = ""
+            if obj:IsA("TextButton") or obj:IsA("TextLabel") then txt = obj.Text end
+            for _, c in ipairs(obj:GetChildren()) do
+                if c:IsA("TextLabel") then txt = txt .. " " .. c.Text end
+            end
+            if txt ~= "" or obj:IsA("GuiButton") then
+                count = count + 1
+                print(string.format("[%d] İsim: %s | Metin: '%s' | Sınıf: %s", count, obj.Name, txt, obj.ClassName))
+            end
+        end
+    end
+    print("=============================================================")
+    GKNotify("Tarama Tamamlandı", count .. " adet buton konsola yazdırıldı (F9).")
+end)
+
+tGK:AddButton("⚽ Manuel Topa Doğru Sıçra", function()
     local oldThreat = Config.GK.SmartThreatOnly
     Config.GK.SmartThreatOnly = false
     _lastDiveTime = 0
     pcall(RunGoalkeeperAI)
     Config.GK.SmartThreatOnly = oldThreat
 end)
+
+tGK:AddSection("⚙️ Kaleci İnce Ayarları")
+tGK:AddSlider("Şut Hız Eşiği (Pas Limiti)", 10, 50, Config.GK.MinShotSpeed, function(v) Config.GK.MinShotSpeed = v end, " spd")
+tGK:AddSlider("Kaleci Algılama Menzili", 15, 80, Config.GK.DiveRange, function(v) Config.GK.DiveRange = v end, " st")
+tGK:AddSlider("Atlama Zamanlaması", 0.3, 1.8, Config.GK.TimeToGoalMax, function(v) Config.GK.TimeToGoalMax = v end, " sn")
 
 -- 4. ESP (GÖRSEL ANALİZ)
 local tESP = CreateTab("ESP", "👁️")
