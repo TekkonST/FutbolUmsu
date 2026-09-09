@@ -143,18 +143,48 @@ local function Round(n, d)
     return math.floor(n * f + 0.5) / f
 end
 
--- Sahadaki Topu Bul (Gelistirilmis Akilli Arama)
+-- Sahadaki Topu Bul (Oyunun Kendi ClientBall Mimarisine Tam Uyumlu)
 local _cachedBall = nil
 local _lastBallSearch = 0
+local _lastBallPos = nil
+local _lastBallPosTime = 0
+local _ballCalculatedVel = Vector3.new(0, 0, 0)
 
 local function FindBall()
     local now = tick()
-    if _cachedBall and _cachedBall.Parent and _cachedBall:IsA("BasePart") and (now - _lastBallSearch < 0.4) then
+    if _cachedBall and _cachedBall.Parent and _cachedBall:IsA("BasePart") and (now - _lastBallSearch < 0.2) then
         return _cachedBall
     end
     _lastBallSearch = now
 
-    -- 1. [ÖZEL] Oyundaki Balls klasoru (workspace.Balls)
+    -- 1. [KESİN BULUCU - BİRİNCİL] Oyunun ClientBall part'ı (workspace.Misc.Visuals altında)
+    local misc = workspace:FindFirstChild("Misc")
+    if misc then
+        local visuals = misc:FindFirstChild("Visuals")
+        if visuals then
+            local mainBall = visuals:FindFirstChild("ClientBall_MainMatch")
+            if mainBall and mainBall:IsA("BasePart") then
+                _cachedBall = mainBall
+                return mainBall
+            end
+            for _, child in ipairs(visuals:GetChildren()) do
+                if child:IsA("BasePart") and child.Name:find("ClientBall") then
+                    _cachedBall = child
+                    return child
+                end
+            end
+        end
+    end
+
+    -- 2. Workspace genelinde ClientBall_ ile başlayan partlar
+    for _, child in ipairs(workspace:GetChildren()) do
+        if child:IsA("BasePart") and child.Name:find("ClientBall") then
+            _cachedBall = child
+            return child
+        end
+    end
+
+    -- 3. Workspace.Balls veya Workspace.Ball klasörü / partı
     local ballsFolder = workspace:FindFirstChild("Balls") or workspace:FindFirstChild("Ball")
     if ballsFolder then
         if ballsFolder:IsA("BasePart") then
@@ -168,16 +198,7 @@ local function FindBall()
         end
     end
 
-    -- 2. Workspace direkt config ismi
-    if Config.Ball.BallName and Config.Ball.BallName ~= "" then
-        local b = workspace:FindFirstChild(Config.Ball.BallName, true)
-        if b and b:IsA("BasePart") then
-            _cachedBall = b
-            return b
-        end
-    end
-
-    -- 3. CollectionService Tag ile
+    -- 4. CollectionService Tag
     local tagged = CollectionService:GetTagged("Ball")
     if tagged and #tagged > 0 then
         for _, t in ipairs(tagged) do
@@ -187,33 +208,49 @@ local function FindBall()
         end
     end
 
-    -- 3. Workspace altındaki yaygın futbol topu isimleri (Türkçe & İngilizce)
-    local commonNames = {"top", "ball", "football", "soccerball", "soccer_ball", "tpsball", "gameball", "matchball", "futbol", "futboltopu"}
-    for _, v in ipairs(workspace:GetDescendants()) do
-        if v:IsA("BasePart") then
-            local n = v.Name:lower()
-            local sz = v.Size.Magnitude
-            if sz > 0.6 and sz < 12 then
-                -- İsim araması
-                for _, cname in ipairs(commonNames) do
-                    if n == cname or n:find(cname) then
-                        _cachedBall = v
-                        return v
-                    end
-                end
-                -- Şekil araması (PartType.Ball veya Mesh)
-                if (v:IsA("Part") and v.Shape == Enum.PartType.Ball) or v:FindFirstChildOfClass("SpecialMesh") then
-                    if n ~= "head" and not v:IsDescendantOf(LocalPlayer.Character or workspace) then
-                        _cachedBall = v
-                        return v
-                    end
-                end
-            end
+    -- 5. Fallback: Workspace içi gerçek futbol topu partı (Karakter parçalarını eler)
+    for _, v in ipairs(workspace:GetChildren()) do
+        local n = v.Name:lower()
+        if (n == "ball" or n == "football" or n == "soccerball" or n:find("matchball")) and v:IsA("BasePart") then
+            _cachedBall = v
+            return v
         end
     end
 
     return _cachedBall
 end
+
+-- Top Hızı ve Yönü Hesaplayıcı (ClientBall Anchored olduğu için frame delta ile hesaplar)
+local function GetBallVelocity(ball)
+    if not ball or not ball:IsA("BasePart") then return Vector3.new(0, 0, 0) end
+    -- Fizik motoru AssemblyLinearVelocity veriyorsa öncelik ver
+    local pVel = ball.AssemblyLinearVelocity
+    if pVel and pVel.Magnitude > 2.0 then
+        return pVel
+    end
+    -- ClientBall Anchored olduğunda frame-by-frame delta hızı kullanılır
+    return _ballCalculatedVel
+end
+
+-- Top Pozisyonu ve Hızını Her Karede Kesintisiz Hesaplayan Dinleyici
+RunService.Heartbeat:Connect(function(dt)
+    local ball = FindBall()
+    if ball and ball:IsA("BasePart") then
+        local pos = ball.Position
+        if _lastBallPos and dt > 0.001 then
+            local instantVel = (pos - _lastBallPos) / dt
+            if instantVel.Magnitude > 0.05 then
+                _ballCalculatedVel = instantVel
+            else
+                _ballCalculatedVel = Vector3.new(0, 0, 0)
+            end
+        end
+        _lastBallPos = pos
+    else
+        _lastBallPos = nil
+        _ballCalculatedVel = Vector3.new(0, 0, 0)
+    end
+end)
 
 -- Top Sende mi? (Cok Katmanli Hassas Algilama)
 local function DoIHaveBall()
@@ -691,7 +728,20 @@ local function PressInGameDiveButton(showNotification, overrideDir)
     local hum = GetHum()
     local dir = overrideDir or (root and root.CFrame.LookVector or Vector3.new(0, 0, 1))
 
-    -- A) [DOĞRUDAN OYUN PROTOKOLÜ] ReplicatedStorage.Remotes.Ball.Tackle
+    -- A) [DOĞRUDAN OYUN PROTOKOLÜ] ActionRemoteProtocol ve ReplicatedStorage.Remotes.Ball.Tackle
+    pcall(function()
+        local arp = require(ReplicatedStorage.Modules.Actions.ActionRemoteProtocol)
+        local ac = require(ReplicatedStorage.Modules.Actions.ActionCommands)
+        if arp and ac and arp.Send and ac.GoalkeeperDive then
+            arp.Send(ac.GoalkeeperDive({
+                AimDirection = dir,
+                DirectionName = "Dive",
+                ShotTime = workspace:GetServerTimeNow()
+            }))
+            triggered = true
+        end
+    end)
+
     pcall(function()
         local remotesFolder = ReplicatedStorage:FindFirstChild("Remotes")
         local ballFolder = remotesFolder and remotesFolder:FindFirstChild("Ball")
@@ -796,11 +846,11 @@ local function RunGoalkeeperAI()
     if not myGoal then myGoal = myRoot; distToGoal = 0 end
 
     local ballPos = ball.Position
-    local ballVel = ball.AssemblyLinearVelocity or Vector3.new(0, 0, 0)
+    local ballVel = GetBallVelocity(ball)
     local ballSpeed = ballVel.Magnitude
 
-    -- 1. PAS VE DURAN TOP FILTRESI (Cok yavas yuvarlanan toplara gereksiz atlamaz)
-    if Config.GK.SmartThreatOnly and ballSpeed < Config.GK.MinShotSpeed then
+    -- 1. DURAN TOP FILTRESI (Sadece tamamen duran ve uzaktaki toplara atlamaz)
+    if Config.GK.SmartThreatOnly and ballSpeed < Config.GK.MinShotSpeed and distToMe > 14 and distToGoal > 15 then
         return
     end
 
@@ -808,50 +858,28 @@ local function RunGoalkeeperAI()
     local distToMe = (myPos - ballPos).Magnitude
     if distToMe > Config.GK.DiveRange then return end
 
-    -- 2. ACI VE YON FILTRESI (Top bize veya kaleye dogru mu geliyor?)
+    -- 2. ACI VE YON FILTRESI (Top kaleciye veya kaleye doğru mu geliyor?)
     local toMe = (myPos - ballPos).Unit
     local toGoal = (myGoal.Position - ballPos).Unit
-    local dotMe = ballVel.Unit:Dot(toMe)
-    local dotGoal = ballVel.Unit:Dot(toGoal)
+    local dotMe, dotGoal = 1, 1
+    if ballSpeed > 0.5 then
+        dotMe = ballVel.Unit:Dot(toMe)
+        dotGoal = ballVel.Unit:Dot(toGoal)
+    end
 
-    -- Yakın mesafedeki tehlikeler (< 16 studs) doğrudan kurtarılır
-    if distToMe > 16.0 and Config.GK.SmartThreatOnly then
-        -- Top bizden veya kaleden bariz uzaklasiyorsa atlama
-        if dotMe < 0.02 and dotGoal < 0.02 then
+    -- Top kaleciden veya kaleden tamamen ters yöne uzaklaşıyorsa atlama (14 stud'dan uzaktaysa)
+    if distToMe > 14.0 and Config.GK.SmartThreatOnly and ballSpeed > 0.5 then
+        if dotMe < -0.25 and dotGoal < -0.25 then
             return
         end
     end
 
-    -- 3. ZAMANLAMA VE HEDEF KESISME HESABI (Time to Impact)
-    local closingSpeed = math.max(ballVel:Dot(toMe), 14)
-    local timeToArrive = distToMe / closingSpeed
+    -- 3. ZAMANLAMA VE TAHMİNİ VARIŞ NOKTASI
+    local closingSpeed = math.max(ballSpeed, 18)
+    local timeToArrive = math.clamp(distToMe / closingSpeed, 0.05, 1.8)
 
-    -- Atlama zaman penceresi
-    if Config.GK.SmartThreatOnly and (timeToArrive < Config.GK.TimeToGoalMin or timeToArrive > Config.GK.TimeToGoalMax) then
-        return
-    end
-
-    -- Yercekimi dahil tahmini varis noktasi
-    local g = -workspace.Gravity
-    local predictedBallPos = ballPos + (ballVel * timeToArrive) + Vector3.new(0, 0.5 * g * (timeToArrive ^ 2), 0)
-
-    -- 4. AUT VE TAC FILTRESI (Kalenin disina bariz giden toplara atlama)
-    if Config.GK.SmartThreatOnly and myGoal ~= myRoot and distToMe > 20 then
-        local goalSize = myGoal.Size
-        local goalPos = myGoal.Position
-        local offX = math.abs(predictedBallPos.X - goalPos.X)
-        local offZ = math.abs(predictedBallPos.Z - goalPos.Z)
-        local maxHoriz = math.max(goalSize.X, goalSize.Z) * 1.3 + 14
-
-        if offX > maxHoriz and offZ > maxHoriz then
-            return -- Auta gidiyor!
-        end
-
-        -- Diregin cok uzerinden ucuyorsa atlama
-        if (predictedBallPos.Y - goalPos.Y) > (goalSize.Y + 20) then
-            return
-        end
-    end
+    local g = -workspace.Gravity * 0.5
+    local predictedBallPos = ballPos + (ballVel * timeToArrive) + Vector3.new(0, g * (timeToArrive ^ 2), 0)
 
     -- ═══════════════════════════════════════════════════════════
     -- 🚀 HEDEF ŞUT ONAYLANDI: PLANJON & KESIN TUTUS BASLATILIYOR!
@@ -1004,12 +1032,47 @@ AddConn(RunService.Heartbeat:Connect(function()
                         isAttacking = true
                     end
 
-                    -- A) TEHLİKE ANINDA ÇALIM / FEINT BAS
+                    -- A) TEHLİKE ANINDA GERÇEK ÇALIM / DODGE BAS
                     if (isAttacking or dist < 5.5) and (now - _lastFeint > 0.35) then
-                        local feintList = { Config.Combat.FeintRemoteName, "Feint", "BodyFeint", "Dodge", "Evade", "Trick", "Skill" }
-                        if SafeFireAny(feintList) then
-                            _lastFeint = now
+                        pcall(function()
+                            local arp = require(ReplicatedStorage.Modules.Actions.ActionRemoteProtocol)
+                            local ac = require(ReplicatedStorage.Modules.Actions.ActionCommands)
+                            if arp and ac and arp.Send and ac.Dodge then
+                                arp.Send(ac.Dodge({
+                                    AimDirection = myRoot.CFrame.LookVector,
+                                    ShotTime = workspace:GetServerTimeNow()
+                                }))
+                            end
+                        end)
+                        pcall(function()
+                            local remotesFolder = ReplicatedStorage:FindFirstChild("Remotes")
+                            local ballFolder = remotesFolder and remotesFolder:FindFirstChild("Ball")
+                            local tackleRemote = ballFolder and ballFolder:FindFirstChild("Tackle")
+                            if tackleRemote and tackleRemote:IsA("RemoteEvent") then
+                                local vel = myRoot.AssemblyLinearVelocity or Vector3.new(0, 0, 0)
+                                tackleRemote:FireServer({
+                                    Protocol = "ActionCommand",
+                                    Command = {
+                                        Kind = "Tackle",
+                                        Mode = "Dodge",
+                                        AimDirection = myRoot.CFrame.LookVector,
+                                        PlayerVelocity = Vector3.new(vel.X, 0, vel.Z),
+                                        ShotTime = workspace:GetServerTimeNow(),
+                                        ActionId = math.random(1000, 99999) * 2 + 1
+                                    }
+                                })
+                            end
+                        end)
+                        local vim = game:GetService("VirtualInputManager")
+                        if vim then
+                            pcall(function()
+                                vim:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
+                                task.delay(0.04, function()
+                                    pcall(function() vim:SendKeyEvent(false, Enum.KeyCode.Q, false, game) end)
+                                end)
+                            end)
                         end
+                        _lastFeint = now
                     end
 
                     -- B) FİZİKSEL TOP KALKANI (BALL SHIELDING)
@@ -1032,7 +1095,7 @@ AddConn(RunService.Heartbeat:Connect(function()
     end
 
     -- ─────────────────────────────────────────────────────────
-    -- 2. AUTO PARRY (SAVUNMA)
+    -- 2. AUTO PARRY (SAVUNMA - DODGE İLE RAKİP MÜDAHALESİNİ ATLATMA)
     -- ─────────────────────────────────────────────────────────
     if Config.Combat.AutoParry and now - _lastParry > Config.Combat.AutoParryDelay then
         pcall(function()
@@ -1048,11 +1111,16 @@ AddConn(RunService.Heartbeat:Connect(function()
                                 local n = tostring(track.Animation.Name):lower()
                                 local id = tostring(track.Animation.AnimationId):lower()
                                 if n:find("punch") or n:find("tackle") or n:find("slide") or n:find("hit") or id:find("slide") then
-                                    local feintList = { Config.Combat.FeintRemoteName, "Feint", "BodyFeint", "Dodge", "Evade" }
-                                    if SafeFireAny(feintList) then
-                                        _lastParry = now
-                                        triggered = true
+                                    local arp = require(ReplicatedStorage.Modules.Actions.ActionRemoteProtocol)
+                                    local ac = require(ReplicatedStorage.Modules.Actions.ActionCommands)
+                                    if arp and ac and arp.Send and ac.Dodge then
+                                        arp.Send(ac.Dodge({
+                                            AimDirection = myRoot.CFrame.LookVector,
+                                            ShotTime = workspace:GetServerTimeNow()
+                                        }))
                                     end
+                                    _lastParry = now
+                                    triggered = true
                                 end
                             end
                         end)
@@ -1078,7 +1146,17 @@ AddConn(RunService.Heartbeat:Connect(function()
                         local tackleDir = (er.Position - myRoot.Position).Unit
                         myRoot.CFrame = CFrame.new(myRoot.Position, Vector3.new(er.Position.X, myRoot.Position.Y, er.Position.Z))
                         
-                        -- A) [DOĞRUDAN OYUN PROTOKOLÜ] ReplicatedStorage.Remotes.Ball.Tackle (SlideTackle)
+                        -- A) [DOĞRUDAN OYUN PROTOKOLÜ] ActionRemoteProtocol ve ReplicatedStorage.Remotes.Ball.Tackle
+                        pcall(function()
+                            local arp = require(ReplicatedStorage.Modules.Actions.ActionRemoteProtocol)
+                            local ac = require(ReplicatedStorage.Modules.Actions.ActionCommands)
+                            if arp and ac and arp.Send and ac.SlideTackle then
+                                arp.Send(ac.SlideTackle({
+                                    AimDirection = tackleDir,
+                                    ShotTime = workspace:GetServerTimeNow()
+                                }))
+                            end
+                        end)
                         pcall(function()
                             local remotesFolder = ReplicatedStorage:FindFirstChild("Remotes")
                             local ballFolder = remotesFolder and remotesFolder:FindFirstChild("Ball")
@@ -1091,6 +1169,7 @@ AddConn(RunService.Heartbeat:Connect(function()
                                         Kind = "Tackle",
                                         Mode = "Slide",
                                         Direction = tackleDir,
+                                        AimDirection = tackleDir,
                                         ClientPosition = myRoot.Position,
                                         UseClientPosition = true,
                                         PlayerVelocity = Vector3.new(vel.X, 0, vel.Z),
@@ -1221,54 +1300,113 @@ AddConn(RunService.Heartbeat:Connect(function()
     pcall(RunGoalkeeperAI)
 end))
 
--- B) SILENT AIM (SUT KONTROLU - OTOMATİK VE MANUEL)
-local _lastBallVelMag = 0
-local function ApplySilentAim()
-    local ball = FindBall()
-    if not ball or not ball:IsA("BasePart") then return end
+-- B) GERÇEK NETWORK HOOK SILENT AIM (ŞUT YÖNÜNÜ DOĞRUDAN KALEYE KİLİTLER)
+local function GetGoalAimDirection()
     local target = GetGoalCorner(Config.Ball.SilentAimCorner)
-    if not target then return end
-
-    local dir = (target - ball.Position).Unit
-    local spd = math.max(ball.AssemblyLinearVelocity.Magnitude, 75)
-    local s   = Clamp(Config.Ball.SilentAimStrength, 0.2, 1.0)
-    ball.AssemblyLinearVelocity = Vector3.new(dir.X * spd * s, dir.Y * spd * s * 0.4 + 10, dir.Z * spd * s)
+    local ball = FindBall()
+    local root = GetRoot()
+    local origin = (ball and ball.Position) or (root and root.Position)
+    if target and origin then
+        return (target - origin).Unit
+    end
+    return nil
 end
 
--- Şut vurulduğu anı tespit eden otomatik Silent Aim dinleyicisi
-AddConn(RunService.Heartbeat:Connect(function()
-    if not Config.Ball.SilentAim then return end
-    local ball = FindBall()
-    local root = GetRoot()
-    if not ball or not root or not ball:IsA("BasePart") then return end
+-- 1. Metamethod Hook (__namecall FireServer Interception)
+if hookmetamethod then
+    pcall(function()
+        local _oldNamecall
+        _oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            local method = getnamecallmethod()
+            local args = {...}
+            if (method == "FireServer" or method == "fireServer") and Config.Ball.SilentAim then
+                local isKick = false
+                pcall(function()
+                    if self.Name == "Kick" or (self.Parent and self.Parent.Name == "Ball" and self.Name == "Kick") then
+                        isKick = true
+                    end
+                end)
+                if isKick and type(args[1]) == "table" then
+                    local packet = args[1]
+                    local cmd = packet.Command
+                    if type(cmd) == "table" and (cmd.Kind == "Kick" or cmd.Kind == "Tackle") then
+                        local goalDir = GetGoalAimDirection()
+                        if goalDir then
+                            cmd.AimDirection = goalDir
+                            cmd.KickDirection = goalDir
+                            if cmd.Direction then cmd.Direction = goalDir end
+                        end
+                    end
+                end
+            end
+            return _oldNamecall(self, table.unpack(args))
+        end)
+    end)
+end
 
-    local currentMag = ball.AssemblyLinearVelocity.Magnitude
-    local dist = (root.Position - ball.Position).Magnitude
-
-    -- Top bizden yeni ayrıldıysa (şut vurulduğunda hız aniden artar ve top 7 stud içindedir)
-    if dist <= 7.0 and currentMag >= 26 and (currentMag - _lastBallVelMag) >= 12 then
-        ApplySilentAim()
+-- 2. ActionRemoteProtocol.Send Hook (İstemci içi şut fonksiyonuna doğrudan kanca)
+pcall(function()
+    local arp = require(ReplicatedStorage.Modules.Actions.ActionRemoteProtocol)
+    if arp and arp.Send then
+        local oldSend = arp.Send
+        arp.Send = function(cmd)
+            if Config.Ball.SilentAim and type(cmd) == "table" and (cmd.Kind == "Kick" or cmd.Kind == "Tackle") then
+                local goalDir = GetGoalAimDirection()
+                if goalDir then
+                    cmd.AimDirection = goalDir
+                    cmd.KickDirection = goalDir
+                    if cmd.Direction then cmd.Direction = goalDir end
+                end
+            end
+            return oldSend(cmd)
+        end
     end
-    _lastBallVelMag = currentMag
-end))
+end)
 
--- C) KAYMA BOOST (SLIDE VELOCITY BOOST)
+-- C) KAYMA BOOST (SLIDE VELOCITY BOOST - SÜREKLİ VE AKICI İVME)
 -- DIKKAT: Ziplama (Freefall) kesinlikle KULLANILMIYOR!
 -- Sadece zemin uzerinde gercek kayma aksiyonunda devreye girer
+local _isSlidingBoostActive = false
 local function TriggerSlideBoost()
+    if _isSlidingBoostActive then return end
     local root = GetRoot()
     local hum  = GetHum()
-    if not root or not hum then return end
+    local char = GetChar()
+    if not root or not hum or not char then return end
 
     -- Sadece karakter yerdeyken calissin (Havada asla boost vermez!)
     if hum.FloorMaterial == Enum.Material.Air then return end
 
-    local moveDir = hum.MoveDirection
-    local dir = moveDir.Magnitude > 0.1 and moveDir.Unit or root.CFrame.LookVector
-    local boostSpeed = (hum.WalkSpeed + 35) * Config.Movement.SlideMultiplier
+    _isSlidingBoostActive = true
+    task.spawn(function()
+        local moveDir = hum.MoveDirection
+        local dir = moveDir.Magnitude > 0.1 and moveDir.Unit or root.CFrame.LookVector
+        local mult = math.clamp(Config.Movement.SlideMultiplier or 3.5, 1.2, 8.0)
+        local boostSpeed = math.max((hum.WalkSpeed + 35) * mult, 60)
 
-    -- Anlik pürüzsüz CFrame + Lineer İvme
-    root.AssemblyLinearVelocity = Vector3.new(dir.X * boostSpeed, root.AssemblyLinearVelocity.Y, dir.Z * boostSpeed)
+        -- Oyun SlidingUntil süresini belirler (genelde 0.65 - 0.85 saniye)
+        local slidingUntil = char:GetAttribute("SlidingUntil")
+        local startTime = tick()
+        local maxDuration = 0.85
+
+        while Config.Movement.SlideBoost and (tick() - startTime < maxDuration) do
+            if not root or not hum or hum.Health <= 0 then break end
+            -- SlidingUntil bittiyse veya havadaysa durdur
+            if slidingUntil and workspace:GetServerTimeNow() > (slidingUntil + 0.05) then
+                break
+            end
+            if hum.FloorMaterial == Enum.Material.Air then
+                break
+            end
+
+            -- Sürekli ve akıcı kayma ivmesi uygula
+            local currentDir = hum.MoveDirection.Magnitude > 0.1 and hum.MoveDirection.Unit or dir
+            root.AssemblyLinearVelocity = Vector3.new(currentDir.X * boostSpeed, root.AssemblyLinearVelocity.Y, currentDir.Z * boostSpeed)
+
+            RunService.Heartbeat:Wait()
+        end
+        _isSlidingBoostActive = false
+    end)
 end
 
 -- Animasyon ve Attribute dinleyici ile kaymayi anla
@@ -1305,47 +1443,71 @@ AddConn(LocalPlayer.CharacterAdded:Connect(function()
     HookSlideAnimation()
 end))
 
--- D) KUTU OTOMASYONU
+-- D) KUTU OTOMASYONU (Stabil ve Kesin Kutu Toplayıcı)
 task.spawn(function()
     while true do
         if Config.Items.BoxTeleport then
             pcall(function()
                 local root = GetRoot()
                 local char = GetChar()
+                local hum = GetHum()
                 if not root or not char then return end
                 local boxes = FindAllBoxes()
                 local nearest, minD = nil, math.huge
                 for _, b in ipairs(boxes) do
-                    if b and b:IsA("BasePart") and b.CanTouch ~= false then
+                    if b and b:IsA("BasePart") and b.CanTouch ~= false and b.Parent then
                         local d = (root.Position - b.Position).Magnitude
                         if d < minD then minD = d; nearest = b end
                     end
                 end
-                if nearest and nearest:IsA("BasePart") and nearest.CanTouch ~= false then
-                    if Config.Items.BoxPullMode == "Teleport" then
-                        -- Karakteri doğrudan Hitbox'ın merkezine yerleştir
-                        root.CFrame = nearest.CFrame
-                    else
-                        nearest.CFrame = root.CFrame
-                    end
 
-                    -- Dokunma tetikle: Tüm ayak ve gövde parçaları ile Hitbox temasını simüle et
+                if nearest and nearest:IsA("BasePart") and nearest.CanTouch ~= false then
+                    -- 1. Karakteri Hitbox'ın hemen üstüne konumlandır ve ivmesini sıfırla
+                    local targetCFrame = nearest.CFrame + Vector3.new(0, 0.6, 0)
+                    root.CFrame = targetCFrame
+                    root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                    if hum then hum:MoveTo(nearest.Position) end
+
+                    -- 2. Çoklu uzuvlarla dokunma BAŞLAT (touch 0)
+                    local touchParts = {
+                        root,
+                        char:FindFirstChild("RightFoot") or char:FindFirstChild("Right Leg") or char:FindFirstChild("RightLowerLeg"),
+                        char:FindFirstChild("LeftFoot") or char:FindFirstChild("Left Leg") or char:FindFirstChild("LeftLowerLeg"),
+                        char:FindFirstChild("LowerTorso") or char:FindFirstChild("Torso"),
+                        char:FindFirstChild("UpperTorso")
+                    }
+
                     if firetouchinterest then
-                        local touchParts = {
-                            root,
-                            char:FindFirstChild("RightFoot") or char:FindFirstChild("Right Leg") or char:FindFirstChild("Right Arm"),
-                            char:FindFirstChild("LeftFoot") or char:FindFirstChild("Left Leg") or char:FindFirstChild("Left Arm"),
-                            char:FindFirstChild("LowerTorso") or char:FindFirstChild("Torso"),
-                            char:FindFirstChild("UpperTorso")
-                        }
                         for _, tp in ipairs(touchParts) do
                             if tp and tp:IsA("BasePart") then
                                 pcall(firetouchinterest, tp, nearest, 0)
-                                pcall(firetouchinterest, tp, nearest, 1)
-                                pcall(firetouchinterest, nearest, tp, 0)
-                                pcall(firetouchinterest, nearest, tp, 1)
                             end
                         end
+                    end
+
+                    -- 3. Sunucunun pozisyon replikasyonunu ve dokunmayı işlemesi için 0.16s bekle (karakteri kutuda tut)
+                    local waitStart = tick()
+                    while tick() - waitStart < 0.18 do
+                        if nearest.CanTouch == false or not nearest.Parent then break end
+                        root.CFrame = targetCFrame
+                        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                        task.wait(0.03)
+                    end
+
+                    -- 4. Dokunmayı BİTİR (touch 1)
+                    if firetouchinterest then
+                        for _, tp in ipairs(touchParts) do
+                            if tp and tp:IsA("BasePart") then
+                                pcall(firetouchinterest, tp, nearest, 1)
+                            end
+                        end
+                    end
+
+                    -- 5. Kutu tamamen CanTouch == false olana kadar kısa bir kontrol beklemesi
+                    local finishWait = tick()
+                    while tick() - finishWait < 0.15 do
+                        if nearest.CanTouch == false or not nearest.Parent then break end
+                        task.wait(0.03)
                     end
                 end
             end)
