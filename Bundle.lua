@@ -856,155 +856,135 @@ end
 -- ===============================================================
 local _lastDiveTime = 0
 
+-- ───────────────────────────────────────────────────────
+-- Kaleci Rolü Kontrolü
+-- ───────────────────────────────────────────────────────
+local function IsGoalkeeper()
+    -- Yöntem 1: Karakter attribute "Role" = "Goalkeeper"
+    local char = GetChar()
+    if char then
+        local roleAttr = pcall(function() return char:GetAttribute("Role") end)
+        local roleVal
+        pcall(function() roleVal = char:GetAttribute("Role") end)
+        if roleVal then
+            local rv = tostring(roleVal):lower()
+            if rv:find("goal") or rv:find("keeper") or rv:find("gk") then return true end
+        end
+        -- Yöntem 2: Karakter'in CollectionService tag'i
+        local cs = game:GetService("CollectionService")
+        for _, tag in ipairs(cs:GetTags(char)) do
+            local t = tag:lower()
+            if t:find("goal") or t:find("keeper") or t:find("gk") then return true end
+        end
+    end
+    -- Yöntem 3: LocalPlayer leaderstats / attribute
+    pcall(function()
+        local lp = LocalPlayer
+        for _, name in ipairs({"Role", "Position", "PlayerRole", "MatchRole"}) do
+            local val = lp:GetAttribute(name)
+            if val then
+                local v = tostring(val):lower()
+                if v:find("goal") or v:find("keeper") or v:find("gk") then return true end
+            end
+        end
+    end)
+    -- Yöntem 4: Kaleciyse kaleye yakın olmalı (fallback — kaleden < 22 stud)
+    local myGoal, distToGoal = GetMyGoal()
+    if myGoal and distToGoal < 22 then return true end
+    return false
+end
+
 local function RunGoalkeeperAI()
     if not Config.GK.AutoDive then return end
 
-    local now = tick()
-    if now - _lastDiveTime < 0.6 then return end -- Cooldown (Seri atlayış engeli)
+    -- ① Kaleci değilsek hiç çalışma
+    if not IsGoalkeeper() then return end
 
-    local ball = FindBall()
-    local myRoot = GetRoot()
-    local char = GetChar()
-    local hum = GetHum()
+    local now = tick()
+    if now - _lastDiveTime < 1.2 then return end  -- Dive cooldown
+
+    local ball    = FindBall()
+    local myRoot  = GetRoot()
+    local char    = GetChar()
+    local hum     = GetHum()
     if not ball or not myRoot or not char or not hum or hum.Health <= 0 then return end
 
-    -- Top zaten bizdeyse atlama
+    -- Topumuzda varsa atlama
     if DoIHaveBall() then return end
 
-    local myPos = myRoot.Position
+    local myPos   = myRoot.Position
     local ballPos = ball.Position
+    local ballVel = GetBallVelocity(ball)
 
-    -- 1. OYUNUN GERÇEK HIZ & KILAVUZ ÇİZGİSİ VERİLERİNİ AL (Renderer Modülü)
-    local ballVel = Vector3.new(0, 0, 0)
-    local isAirborne = false
-    local flightStartedAt = nil
-
+    -- Renderer'dan gerçek top hızı al
     pcall(function()
         local Renderer = require(ReplicatedStorage.Client.Gameplay.Ball.Renderer)
         if Renderer and Renderer.GetMovementState then
             local ms = Renderer.GetMovementState()
-            if ms then
-                if ms.Velocity and ms.Velocity.Magnitude > 2 then
-                    ballVel = ms.Velocity
-                end
-                isAirborne = (ms.Mode == "Airborne")
-                flightStartedAt = ms.FlightStartedAt or ms.StartedAt
+            if ms and ms.Velocity and ms.Velocity.Magnitude > ballVel.Magnitude then
+                ballVel = ms.Velocity
             end
         end
     end)
 
-    if ballVel.Magnitude <= 2 then
-        ballVel = GetBallVelocity(ball)
-    end
-
     local ballSpeed = ballVel.Magnitude
-    local distToMe = (myPos - ballPos).Magnitude
+    local distToMe  = (myPos - ballPos).Magnitude
 
-    -- 2. TOP AYAKTAN ÇIKTI MI? (Şut Başlangıcı Tespiti)
-    local isShotActive = (ballSpeed >= 10) or isAirborne
-    if not isShotActive then
-        -- Top yavaşsa veya duruyorsa sadece kalecinin dibindeyse (8 stud) atla
-        if distToMe > 8 then return end
-    end
+    -- ② Yalnızca gerçek şut: top hızı eşiğinin üzerinde olmalı
+    if ballSpeed < Config.GK.MinShotSpeed then return end
 
-    -- Korunan Kaleyi Bul
+    -- ③ Top kaleye doğru gelmeli (arka yöne giden topa tepki verme)
     local myGoal, distToGoal = GetMyGoal()
     local goalPos = (myGoal and myGoal.Position) or myPos
 
-    -- 3. HEDEF & YÖN KONTROLÜ (Top Kaleye veya Kaleciye Doğru mu Geliyor?)
-    local toMe = (myPos - ballPos).Unit
-    local toGoal = (goalPos - ballPos).Unit
-    local dotMe = ballSpeed > 0.5 and ballVel.Unit:Dot(toMe) or 1
-    local dotGoal = ballSpeed > 0.5 and ballVel.Unit:Dot(toGoal) or 1
+    -- Top → kale yönü dot product
+    local toGoal  = (goalPos - ballPos)
+    local dotGoal = (ballSpeed > 0.5) and ballVel.Unit:Dot(toGoal.Unit) or 0
+    if dotGoal < 0.15 then return end  -- top kaleye gitmiyor
 
-    -- Top kaleciden ve kaleden tamamen uzaklaşıyorsa (ters yöne gidiyorsa) atlama
-    if distToMe > 12 and (dotMe < -0.3 and dotGoal < -0.3) then
-        return
-    end
+    -- ④ Çok uzaktaki toplar: daha yaklaştığında tepki ver
+    local timeToArrive = distToMe / math.max(ballSpeed, 20)
+    if timeToArrive > Config.GK.TimeToGoalMax then return end
 
-    -- 4. KILAVUZ ÇİZGİSİ VE VARIŞ ZAMANI ("KALEYE GELİNCE")
-    local closingSpeed = math.max(ballSpeed, 24)
-    local timeToArrive = distToMe / closingSpeed
+    -- ⑤ Sıçrama yönünü hesapla (topun tahmini varış noktası)
+    local interceptT   = math.clamp(timeToArrive, 0.05, 0.4)
+    local predictedPos = ballPos + (ballVel * interceptT)
+    local saveVec2D    = Vector3.new(predictedPos.X - myPos.X, 0, predictedPos.Z - myPos.Z)
+    local diveDir      = saveVec2D.Magnitude > 0.1 and saveVec2D.Unit or myRoot.CFrame.LookVector
 
-    -- Top henüz uzaktaysa (0.55 saniyeden fazla varsa) kaleye yaklaşana kadar bekle!
-    if timeToArrive > 0.55 and distToMe > 32 then
-        return
-    end
-
-    -- 5. SIÇRAMA VE KURTARIŞ NOKTASI (Topun Geldiği Yön)
-    local predictedIntercept = ballPos + (ballVel * math.clamp(timeToArrive, 0.05, 0.45))
-    local saveVec = (predictedIntercept - myPos)
-    local diveDir2D = Vector3.new(saveVec.X, 0, saveVec.Z)
-    if diveDir2D.Magnitude > 0.1 then
-        diveDir2D = diveDir2D.Unit
-    else
-        diveDir2D = myRoot.CFrame.LookVector
-    end
-
-    -- ═══════════════════════════════════════════════════════════
-    -- 🚀 GERÇEK VE GÜÇLÜ SIÇRAYARAK PLANJON (LEAP & DIVE ACTION)
-    -- ═══════════════════════════════════════════════════════════
+    -- ═══════════════════════════════════════════════
+    -- 🧤 SADE SIÇRAMA: Sadece oyunun kendi mekaniki
+    -- ═══════════════════════════════════════════════
     _lastDiveTime = now
 
-    -- A) Karakteri anında topun geldiği yöne çevir
+    -- Karakteri topa doğru döndür
     pcall(function()
-        myRoot.CFrame = CFrame.lookAt(myPos, myPos + Vector3.new(diveDir2D.X, 0, diveDir2D.Z))
+        myRoot.CFrame = CFrame.lookAt(myPos, myPos + Vector3.new(diveDir.X, 0, diveDir.Z))
     end)
 
-    -- B) OYUNUN KENDİ PLANJON VE TUŞ PROTOKOLÜNÜ TETİKLE
+    -- Oyunun kendi GoalkeeperDive aksiyonunu tetikle (velocity override YOK)
     task.spawn(function()
-        PressInGameDiveButton(false, diveDir2D)
-        task.wait(0.04)
-        PressInGameDiveButton(false, diveDir2D)
+        PressInGameDiveButton(false, diveDir)
     end)
 
-    -- C) GERÇEK FİZİKSEL SIÇRAMA (JUMP & HIGH-VELOCITY LEAP)
-    -- Karakter havaya doğru ve topun geldiği yöne doğru güçlü bir sıçrama yapar!
-    task.spawn(function()
-        -- Humanoid jump tetikle
-        hum:ChangeState(Enum.HumanoidStateType.Jumping)
-        hum.Jump = true
-
-        -- Yukarı ve ileri doğru güçlü sıçrama ivmesi
-        local heightDiff = math.clamp(predictedIntercept.Y - myPos.Y, -2, 14)
-        local verticalImpulse = math.clamp(26 + (heightDiff * 1.8), 24, 48)
-        local forwardImpulse = math.clamp(distToMe * 1.8 + 28, 38, 62)
-
-        local leapVel = (diveDir2D * forwardImpulse) + Vector3.new(0, verticalImpulse, 0)
-
-        -- İvmeyi 0.20 saniye boyunca uygulayarak Roblox fiziğinin ezmesini engelle
-        local leapStart = tick()
-        while tick() - leapStart < 0.20 do
-            if not myRoot or not hum or hum.Health <= 0 then break end
-            myRoot.AssemblyLinearVelocity = Vector3.new(leapVel.X, myRoot.AssemblyLinearVelocity.Y > 0 and myRoot.AssemblyLinearVelocity.Y or leapVel.Y, leapVel.Z)
-            task.wait(0.025)
-        end
-    end)
-
-    -- D) KESİN TUTUŞ (100% TOUCH & CATCH)
+    -- Kesin tutuş (PerfectCatch toggle açıksa)
     if Config.GK.PerfectCatch then
         task.spawn(function()
-            local catchStart = tick()
-            while tick() - catchStart < 0.75 do
+            local t0 = tick()
+            while tick() - t0 < 0.8 do
                 task.wait(0.02)
                 if not ball or not myRoot then break end
-                local curDist = (myRoot.Position - ball.Position).Magnitude
-                if curDist <= 10.0 then
-                    local touchParts = {
+                if (myRoot.Position - ball.Position).Magnitude <= 9 then
+                    local parts = {
                         char:FindFirstChild("RightHand") or char:FindFirstChild("Right Arm"),
-                        char:FindFirstChild("LeftHand") or char:FindFirstChild("Left Arm"),
+                        char:FindFirstChild("LeftHand")  or char:FindFirstChild("Left Arm"),
                         char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso"),
-                        char:FindFirstChild("Head"),
                         myRoot
                     }
-                    if firetouchinterest then
-                        for _, p in ipairs(touchParts) do
-                            if p then
-                                pcall(firetouchinterest, p, ball, 0)
-                                pcall(firetouchinterest, p, ball, 1)
-                                pcall(firetouchinterest, ball, p, 0)
-                                pcall(firetouchinterest, ball, p, 1)
-                            end
+                    for _, p in ipairs(parts) do
+                        if p and firetouchinterest then
+                            pcall(firetouchinterest, p, ball, 0)
+                            pcall(firetouchinterest, p, ball, 1)
                         end
                     end
                 end
@@ -1947,29 +1927,31 @@ local floatBtn = MI("TextButton", {
 Corner(floatBtn, BTN_SIZE / 2)
 Stroke(floatBtn, THEME.Accent, 1.8, 0.1)
 
--- Kararlı Sürükleme: Click/Drag Eşiği + Ekran Sınırı
+-- Kararlı Sürükleme: AbsolutePosition tabanlı + Click/Drag Eşiği + Ekran Sınırı
 do
     local DRAG_THRESHOLD = 6  -- px — altında sürükleme başlamaz (tap korunur)
-    local dragging = false
-    local didDrag  = false
-    local inputId  = nil
-    local dragStartPos  = nil  -- ekran pozisyonu (touch/mouse)
-    local btnStartX, btnStartY = 14, nil  -- başlangıç offset
+    local dragging   = false
+    local didDrag    = false
+    local tracking   = false  -- herhangi bir input yakaladık mı
+    local dragStartPos  = nil  -- ekran başlangıç noktası (touch/mouse)
+    local btnAbsStartX  = 0
+    local btnAbsStartY  = 0
 
     floatBtn.InputBegan:Connect(function(inp)
         local t = inp.UserInputType
         if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
-            inputId = inp
-            dragging  = false
-            didDrag   = false
-            dragStartPos = Vector2.new(inp.Position.X, inp.Position.Y)
-            btnStartX    = floatBtn.Position.X.Offset
-            btnStartY    = floatBtn.Position.Y.Offset
+            tracking      = true
+            dragging      = false
+            didDrag       = false
+            dragStartPos  = Vector2.new(inp.Position.X, inp.Position.Y)
+            -- AbsolutePosition = gerçek piksel konumu (Scale bozulmaz)
+            btnAbsStartX  = floatBtn.AbsolutePosition.X
+            btnAbsStartY  = floatBtn.AbsolutePosition.Y
         end
     end)
 
     UserInputService.InputChanged:Connect(function(inp)
-        if not inputId then return end
+        if not tracking then return end
         local t = inp.UserInputType
         if t ~= Enum.UserInputType.MouseMovement and t ~= Enum.UserInputType.Touch then return end
 
@@ -1985,23 +1967,25 @@ do
             end
         end
 
-        -- Ekran sınırlarına sabitle
+        -- Ekran sınırlarına sabitle (her zaman offset tabanlı UDim2)
         local vp = Camera and Camera.ViewportSize or Vector2.new(800, 600)
-        local newX = math.clamp(btnStartX + dx, 4, vp.X - BTN_SIZE - 4)
-        local newY = math.clamp(btnStartY + dy, 4, vp.Y - BTN_SIZE - 4)
+        local newX = math.clamp(btnAbsStartX + dx, 4, vp.X - BTN_SIZE - 4)
+        local newY = math.clamp(btnAbsStartY + dy, 4, vp.Y - BTN_SIZE - 4)
         floatBtn.Position = UDim2.new(0, newX, 0, newY)
     end)
 
     local function onInputEnd(inp)
-        if inp ~= inputId then return end
-        dragging = false
-        inputId  = nil
+        local t = inp.UserInputType
+        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+            dragging = false
+            tracking = false
+        end
     end
 
     floatBtn.InputEnded:Connect(onInputEnd)
     UserInputService.InputEnded:Connect(onInputEnd)
 
-    -- Tap (click) → sadece drag olmadıysa menüyü aç
+    -- Tap (click) → sadece drag olmadıysa menüyü aç/kapat
     floatBtn.MouseButton1Click:Connect(function()
         if not didDrag then
             mainFrame.Visible = not mainFrame.Visible
