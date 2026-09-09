@@ -97,12 +97,12 @@ local Config = {
     },
     GK = {
         AutoDive         = true,    -- Otomatik kaleci atlayisi (varsayilan acik)
-        SmartThreatOnly  = true,    -- Sadece kaleye gelen gercek sutlara atla (paslari ve autu eler)
+        SmartThreatOnly  = true,    -- Sadece kaleye/bize gelen gercek sutlara atla (paslari ve autu eler)
         PerfectCatch     = true,    -- Kesin top tutma / kacirmama (Touch & Catch kilidi)
-        DiveRange        = 48,      -- Algilama menzili (studs)
-        MinShotSpeed     = 16,      -- Sut hiz esigi (bu hiz altindaki yavas paslara atlamaz)
-        TimeToGoalMax    = 1.3,     -- En fazla kac saniye kala atlasin
-        TimeToGoalMin    = 0.05,    -- Cok gec kalmamak icin alt sinir
+        DiveRange        = 55,      -- Algilama menzili (studs)
+        MinShotSpeed     = 8,       -- Sut hiz esigi (yavas yuvarlanan toplara atlamaz, sut ve asirtmalara atlar)
+        TimeToGoalMax    = 2.2,     -- En fazla kac saniye kala atlasin
+        TimeToGoalMin    = 0.02,    -- Cok gec kalmamak icin alt sinir
         BoostPhysical    = true,    -- Sıçramaya ek ivme desteği
     },
 }
@@ -252,14 +252,20 @@ local function DoIHaveBall()
     end
 
     -- 3. Dinamik Mesafe & En Yakin Oyuncu Kontrolu
+    -- KRİTİK: Top hızla uçuyorsa (şut veya pas), kimsenin ayağında olamaz!
+    local bVel = ball.AssemblyLinearVelocity or Vector3.new(0, 0, 0)
+    if bVel.Magnitude > 11 then
+        return false
+    end
+
     local dist = (root.Position - ball.Position).Magnitude
-    if dist <= 6.5 then
+    if dist <= 4.2 then
         -- Topa bizden daha yakin baska rakip var mi?
         local isClosest = true
         for _, p in ipairs(Players:GetPlayers()) do
             if p ~= LocalPlayer and p.Character then
                 local pr = p.Character:FindFirstChild("HumanoidRootPart")
-                if pr and (pr.Position - ball.Position).Magnitude < (dist - 0.7) then
+                if pr and (pr.Position - ball.Position).Magnitude < (dist - 0.5) then
                     isClosest = false
                     break
                 end
@@ -292,30 +298,34 @@ local function GetNearestEnemy(radius)
     return nearest, minD
 end
 
--- Sahadaki Kutulari Bul (GameplayItemBox & ItemBox Arama)
+-- Sahadaki Kutulari Bul (GameplayItemBox & Hitbox Parçası Taraması)
 local function FindAllBoxes()
     local found = {}
     
-    -- 1. [ÖZEL] Oyundaki GameplayItemBox etiket ve modelleri
+    -- 1. [ÖZEL] Oyundaki GameplayItemBox etiketli modeller (Hitbox parçası aranır)
     local tagBoxes = CollectionService:GetTagged("GameplayItemBox")
     for _, b in ipairs(tagBoxes) do
-        local bp = b:IsA("BasePart") and b or b:FindFirstChildWhichIsA("BasePart")
-        if bp then table.insert(found, bp) end
+        local hb = b:FindFirstChild("Hitbox") or b:FindFirstChild("Box") or (b:IsA("BasePart") and b)
+        if hb and hb:IsA("BasePart") and hb.CanTouch ~= false and not table.find(found, hb) then
+            table.insert(found, hb)
+        end
     end
 
     local tagBoxes2 = CollectionService:GetTagged(Config.Items.BoxTag)
     for _, b in ipairs(tagBoxes2) do
-        local bp = b:IsA("BasePart") and b or b:FindFirstChildWhichIsA("BasePart")
-        if bp and not table.find(found, bp) then table.insert(found, bp) end
+        local hb = b:FindFirstChild("Hitbox") or b:FindFirstChild("Box") or (b:IsA("BasePart") and b)
+        if hb and hb:IsA("BasePart") and hb.CanTouch ~= false and not table.find(found, hb) then
+            table.insert(found, hb)
+        end
     end
 
     -- 2. Isim taramasi (GameplayItemBox, SkillBox, ItemBox, LuckyBlock)
     for _, v in ipairs(workspace:GetDescendants()) do
         local n = v.Name:lower()
-        if n == "gameplayitembox" or n:find("gameplayitembox") or n:find("itembox") or n == Config.Items.BoxTag:lower() or n:find("skillbox") or n:find("luckyblock") then
-            local bp = v:IsA("BasePart") and v or v:FindFirstChildWhichIsA("BasePart")
-            if bp and not table.find(found, bp) then
-                table.insert(found, bp)
+        if n == "gameplayitembox" or n:find("itembox") or n == Config.Items.BoxTag:lower() or n:find("skillbox") or n:find("luckyblock") then
+            local hb = v:FindFirstChild("Hitbox") or v:FindFirstChild("Box") or (v:IsA("BasePart") and v)
+            if hb and hb:IsA("BasePart") and hb.CanTouch ~= false and not table.find(found, hb) then
+                table.insert(found, hb)
             end
         end
     end
@@ -662,7 +672,7 @@ local function TriggerPlanjonElement(elem)
 end
 
 -- Oyundaki Kaleci Planjon Butonunu Bul ve Eksiksiz Tetikle
-local function PressInGameDiveButton(showNotification)
+local function PressInGameDiveButton(showNotification, overrideDir)
     local triggered = false
     local targetBtn = FindPlanjonButton()
 
@@ -676,26 +686,44 @@ local function PressInGameDiveButton(showNotification)
         GKNotify("Buton Aranıyor", "Planjon butonu taranıyor... 'Butona Dokunarak Tanıt' da kullanabilirsiniz.")
     end
 
-    -- B) [DOĞRUDAN OYUN PROTOKOLÜ] ReplicatedStorage.Remotes.Actions.Action (GoalkeeperDive)
+    local root = GetRoot()
+    local char = GetChar()
+    local hum = GetHum()
+    local dir = overrideDir or (root and root.CFrame.LookVector or Vector3.new(0, 0, 1))
+
+    -- A) [DOĞRUDAN OYUN PROTOKOLÜ] ReplicatedStorage.Remotes.Ball.Tackle
     pcall(function()
         local remotesFolder = ReplicatedStorage:FindFirstChild("Remotes")
-        if remotesFolder then
-            local actionsFolder = remotesFolder:FindFirstChild("Actions")
-            if actionsFolder then
-                local actionRemote = actionsFolder:FindFirstChild("Action")
-                if actionRemote and actionRemote:IsA("RemoteEvent") then
-                    local root = GetRoot()
-                    local dir = root and root.CFrame.LookVector or Vector3.new(0, 0, 1)
-                    actionRemote:FireServer({
-                        Kind = "GoalkeeperDive",
-                        Direction = dir,
-                        AimDirection = dir,
-                        ClientPosition = root and root.Position or Vector3.new(0, 0, 0),
-                        UseClientPosition = true
-                    })
-                    triggered = true
-                end
-            end
+        local ballFolder = remotesFolder and remotesFolder:FindFirstChild("Ball")
+        local tackleRemote = ballFolder and ballFolder:FindFirstChild("Tackle")
+        if tackleRemote and tackleRemote:IsA("RemoteEvent") and root then
+            local vel = root.AssemblyLinearVelocity or Vector3.new(0, 0, 0)
+            tackleRemote:FireServer({
+                Protocol = "ActionCommand",
+                Command = {
+                    Kind = "Tackle",
+                    Mode = "GoalkeeperDive",
+                    Direction = dir,
+                    AimDirection = dir,
+                    ClientPosition = root.Position,
+                    UseClientPosition = true,
+                    PlayerVelocity = Vector3.new(vel.X, 0, vel.Z),
+                    ShotTime = workspace:GetServerTimeNow(),
+                    ActionId = math.random(1000, 99999) * 2 + 1
+                }
+            })
+            triggered = true
+        end
+    end)
+
+    -- B) [İSTEMCİ MODÜLÜ] GoalkeeperDive presentation & fiziksel hareket
+    pcall(function()
+        local gkd = require(ReplicatedStorage.Modules.Actions.GoalkeeperDive)
+        if gkd and char and hum then
+            gkd.Run(char, hum, dir, function()
+                return Camera and Camera.CFrame or (root and root.CFrame or CFrame.new())
+            end)
+            triggered = true
         end
     end)
 
@@ -703,7 +731,7 @@ local function PressInGameDiveButton(showNotification)
     pcall(function()
         local cas = game:GetService("ContextActionService")
         local actionNames = {
-            "Dive", "dive", "DIVE", "Planjon", "planjon", "PLANJON", "Plongeon",
+            "Dive", "dive", "DIVE", "Planjon", "planjon", "PLANJON",
             "GoalkeeperDive", "Tackle", "Jump", "MobileDive"
         }
         for _, act in ipairs(actionNames) do
@@ -714,31 +742,30 @@ local function PressInGameDiveButton(showNotification)
         end
     end)
 
-    -- D) Remote Event / Remote Function cagrilari
+    -- D) Virtual Klavye & Fare Tuşları (E tuşu ve MouseButton2 - PC Keybinds)
+    local vim = game:GetService("VirtualInputManager")
+    if vim then
+        pcall(function()
+            vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+            task.delay(0.03, function()
+                pcall(function() vim:SendKeyEvent(false, Enum.KeyCode.E, false, game) end)
+            end)
+        end)
+        pcall(function()
+            vim:SendMouseButtonEvent(0, 0, 1, true, game, 0)
+            task.delay(0.03, function()
+                pcall(function() vim:SendMouseButtonEvent(0, 0, 1, false, game, 0) end)
+            end)
+        end)
+    end
+
+    -- E) Remote Event / Remote Function fallback
     local diveRemotes = {
         "GoalkeeperDive", "Dive", "dive", "Planjon", "planjon", "PlanjonAction",
         "GKPlanjon", "GKDive", "KeeperDive", "GK_Dive", "Save", "save", "GoalieDive"
     }
     if SafeFireAny(diveRemotes) then
         triggered = true
-    end
-
-    -- E) Virtual Klavye Tuşları (E, Q, Space, F)
-    local vim = game:GetService("VirtualInputManager")
-    if vim then
-        pcall(function()
-            local keys = { Enum.KeyCode.E, Enum.KeyCode.Space, Enum.KeyCode.Q, Enum.KeyCode.F }
-            for _, k in ipairs(keys) do
-                vim:SendKeyEvent(true, k, false, game)
-            end
-            task.delay(0.04, function()
-                pcall(function()
-                    for _, k in ipairs(keys) do
-                        vim:SendKeyEvent(false, k, false, game)
-                    end
-                end)
-            end)
-        end)
     end
 
     return triggered
@@ -768,14 +795,11 @@ local function RunGoalkeeperAI()
     local myGoal, distToGoal = GetMyGoal()
     if not myGoal then myGoal = myRoot; distToGoal = 0 end
 
-    -- Kaleci kalesinden çok uzakta değilse aktif olsun
-    if distToGoal > 110 and myGoal ~= myRoot then return end
-
     local ballPos = ball.Position
     local ballVel = ball.AssemblyLinearVelocity or Vector3.new(0, 0, 0)
     local ballSpeed = ballVel.Magnitude
 
-    -- 1. PAS FILTRESI (Yavas yuvarlanan paslara asla atlama!)
+    -- 1. PAS VE DURAN TOP FILTRESI (Cok yavas yuvarlanan toplara gereksiz atlamaz)
     if Config.GK.SmartThreatOnly and ballSpeed < Config.GK.MinShotSpeed then
         return
     end
@@ -790,9 +814,12 @@ local function RunGoalkeeperAI()
     local dotMe = ballVel.Unit:Dot(toMe)
     local dotGoal = ballVel.Unit:Dot(toGoal)
 
-    -- Top bizden veya kaleden tamamen uzaklasiyorsa atlama
-    if Config.GK.SmartThreatOnly and dotMe < 0.08 and dotGoal < 0.08 then
-        return
+    -- Yakın mesafedeki tehlikeler (< 16 studs) doğrudan kurtarılır
+    if distToMe > 16.0 and Config.GK.SmartThreatOnly then
+        -- Top bizden veya kaleden bariz uzaklasiyorsa atlama
+        if dotMe < 0.02 and dotGoal < 0.02 then
+            return
+        end
     end
 
     -- 3. ZAMANLAMA VE HEDEF KESISME HESABI (Time to Impact)
@@ -809,19 +836,19 @@ local function RunGoalkeeperAI()
     local predictedBallPos = ballPos + (ballVel * timeToArrive) + Vector3.new(0, 0.5 * g * (timeToArrive ^ 2), 0)
 
     -- 4. AUT VE TAC FILTRESI (Kalenin disina bariz giden toplara atlama)
-    if Config.GK.SmartThreatOnly and myGoal ~= myRoot then
+    if Config.GK.SmartThreatOnly and myGoal ~= myRoot and distToMe > 20 then
         local goalSize = myGoal.Size
         local goalPos = myGoal.Position
         local offX = math.abs(predictedBallPos.X - goalPos.X)
         local offZ = math.abs(predictedBallPos.Z - goalPos.Z)
-        local maxHoriz = math.max(goalSize.X, goalSize.Z) * 1.1 + 10
+        local maxHoriz = math.max(goalSize.X, goalSize.Z) * 1.3 + 14
 
         if offX > maxHoriz and offZ > maxHoriz then
             return -- Auta gidiyor!
         end
 
         -- Diregin cok uzerinden ucuyorsa atlama
-        if (predictedBallPos.Y - goalPos.Y) > (goalSize.Y + 16) then
+        if (predictedBallPos.Y - goalPos.Y) > (goalSize.Y + 20) then
             return
         end
     end
@@ -856,13 +883,13 @@ local function RunGoalkeeperAI()
         end
     end)
 
-    -- C) PLANJON BUTONUNU SENKRONİZE VE SERİ ŞEKİLDE TETİKLE
+    -- C) PLANJON BUTONUNU VE PROTOKOLÜNÜ HEDEF YÖNÜYLE TETİKLE
     task.spawn(function()
-        PressInGameDiveButton(false)
+        PressInGameDiveButton(false, diveDir2D)
         task.wait(0.03)
-        PressInGameDiveButton(false)
+        PressInGameDiveButton(false, diveDir2D)
         task.wait(0.05)
-        PressInGameDiveButton(false)
+        PressInGameDiveButton(false, diveDir2D)
     end)
 
     -- D) Fiziksel sıçrama ve ivme desteği (Topu havada kesin karşılamak için)
@@ -1051,22 +1078,30 @@ AddConn(RunService.Heartbeat:Connect(function()
                         local tackleDir = (er.Position - myRoot.Position).Unit
                         myRoot.CFrame = CFrame.new(myRoot.Position, Vector3.new(er.Position.X, myRoot.Position.Y, er.Position.Z))
                         
-                        -- A) [DOĞRUDAN OYUN PROTOKOLÜ] ReplicatedStorage.Remotes.Actions.Action (SlideTackle)
-                        local remotesFolder = ReplicatedStorage:FindFirstChild("Remotes")
-                        if remotesFolder then
-                            local actFolder = remotesFolder:FindFirstChild("Actions")
-                            local actRemote = actFolder and actFolder:FindFirstChild("Action")
-                            if actRemote and actRemote:IsA("RemoteEvent") then
-                                actRemote:FireServer({
-                                    Kind = "SlideTackle",
-                                    Direction = tackleDir,
-                                    ClientPosition = myRoot.Position,
-                                    UseClientPosition = true
+                        -- A) [DOĞRUDAN OYUN PROTOKOLÜ] ReplicatedStorage.Remotes.Ball.Tackle (SlideTackle)
+                        pcall(function()
+                            local remotesFolder = ReplicatedStorage:FindFirstChild("Remotes")
+                            local ballFolder = remotesFolder and remotesFolder:FindFirstChild("Ball")
+                            local tackleRemote = ballFolder and ballFolder:FindFirstChild("Tackle")
+                            if tackleRemote and tackleRemote:IsA("RemoteEvent") then
+                                local vel = myRoot.AssemblyLinearVelocity or Vector3.new(0, 0, 0)
+                                tackleRemote:FireServer({
+                                    Protocol = "ActionCommand",
+                                    Command = {
+                                        Kind = "Tackle",
+                                        Mode = "Slide",
+                                        Direction = tackleDir,
+                                        ClientPosition = myRoot.Position,
+                                        UseClientPosition = true,
+                                        PlayerVelocity = Vector3.new(vel.X, 0, vel.Z),
+                                        ShotTime = workspace:GetServerTimeNow(),
+                                        ActionId = math.random(1000, 99999) * 2 + 1
+                                    }
                                 })
                             end
-                        end
+                        end)
 
-                        -- B) Mobil Button1 (Tackle) butonu tetikle
+                        -- B) Mobil Button1 (Tackle) butonunu tetikle
                         local pgui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
                         if pgui then
                             local mob = pgui:FindFirstChild("Mobile")
@@ -1074,6 +1109,17 @@ AddConn(RunService.Heartbeat:Connect(function()
                             if tBtn then
                                 TriggerPlanjonElement(tBtn)
                             end
+                        end
+
+                        -- C) PC Tuşu E (Tackle Keybind)
+                        local vim = game:GetService("VirtualInputManager")
+                        if vim then
+                            pcall(function()
+                                vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+                                task.delay(0.04, function()
+                                    pcall(function() vim:SendKeyEvent(false, Enum.KeyCode.E, false, game) end)
+                                end)
+                            end)
                         end
 
                         local tackleList = { Config.Combat.TackleRemoteName, "Tackle", "SlideTackle", "Slide", "Steal" }
@@ -1225,21 +1271,32 @@ local function TriggerSlideBoost()
     root.AssemblyLinearVelocity = Vector3.new(dir.X * boostSpeed, root.AssemblyLinearVelocity.Y, dir.Z * boostSpeed)
 end
 
--- Animasyon dinleyici ile kaymayi anla
+-- Animasyon ve Attribute dinleyici ile kaymayi anla
 local function HookSlideAnimation()
+    local char = GetChar()
     local hum = GetHum()
     local anim = hum and hum:FindFirstChildOfClass("Animator")
-    if not anim then return end
 
-    AddConn(anim.AnimationPlayed:Connect(function(track)
-        if not Config.Movement.SlideBoost then return end
-        local n = track.Animation.Name:lower()
-        local id = tostring(track.Animation.AnimationId):lower()
-        if n:find("slide") or n:find("tackle") or n:find("kay") or n:find("dash")
-           or id:find("slide") or id:find("tackle") then
-            TriggerSlideBoost()
-        end
-    end))
+    if char then
+        AddConn(char:GetAttributeChangedSignal("SlidingUntil"):Connect(function()
+            if not Config.Movement.SlideBoost then return end
+            if char:GetAttribute("SlidingUntil") then
+                TriggerSlideBoost()
+            end
+        end))
+    end
+
+    if anim then
+        AddConn(anim.AnimationPlayed:Connect(function(track)
+            if not Config.Movement.SlideBoost then return end
+            local n = track.Animation.Name:lower()
+            local id = tostring(track.Animation.AnimationId):lower()
+            if n:find("slide") or n:find("tackle") or n:find("kay") or n:find("dash")
+               or id:find("slide") or id:find("tackle") then
+                TriggerSlideBoost()
+            end
+        end))
+    end
 end
 
 HookSlideAnimation()
@@ -1254,23 +1311,41 @@ task.spawn(function()
         if Config.Items.BoxTeleport then
             pcall(function()
                 local root = GetRoot()
-                if not root then return end
+                local char = GetChar()
+                if not root or not char then return end
                 local boxes = FindAllBoxes()
                 local nearest, minD = nil, math.huge
                 for _, b in ipairs(boxes) do
-                    local d = (root.Position - b.Position).Magnitude
-                    if d < minD then minD = d; nearest = b end
-                end
-                if nearest then
-                    if Config.Items.BoxPullMode == "Teleport" then
-                        root.CFrame = CFrame.new(nearest.Position + Vector3.new(0, 1.5, 0))
-                    else
-                        nearest.CFrame = CFrame.new(root.Position + Vector3.new(0, 1, 0))
+                    if b and b:IsA("BasePart") and b.CanTouch ~= false then
+                        local d = (root.Position - b.Position).Magnitude
+                        if d < minD then minD = d; nearest = b end
                     end
-                    -- Dokunma tetikle (firetouchinterest ile kutuyu anında aç)
+                end
+                if nearest and nearest:IsA("BasePart") and nearest.CanTouch ~= false then
+                    if Config.Items.BoxPullMode == "Teleport" then
+                        -- Karakteri doğrudan Hitbox'ın merkezine yerleştir
+                        root.CFrame = nearest.CFrame
+                    else
+                        nearest.CFrame = root.CFrame
+                    end
+
+                    -- Dokunma tetikle: Tüm ayak ve gövde parçaları ile Hitbox temasını simüle et
                     if firetouchinterest then
-                        pcall(firetouchinterest, root, nearest, 0)
-                        pcall(firetouchinterest, root, nearest, 1)
+                        local touchParts = {
+                            root,
+                            char:FindFirstChild("RightFoot") or char:FindFirstChild("Right Leg") or char:FindFirstChild("Right Arm"),
+                            char:FindFirstChild("LeftFoot") or char:FindFirstChild("Left Leg") or char:FindFirstChild("Left Arm"),
+                            char:FindFirstChild("LowerTorso") or char:FindFirstChild("Torso"),
+                            char:FindFirstChild("UpperTorso")
+                        }
+                        for _, tp in ipairs(touchParts) do
+                            if tp and tp:IsA("BasePart") then
+                                pcall(firetouchinterest, tp, nearest, 0)
+                                pcall(firetouchinterest, tp, nearest, 1)
+                                pcall(firetouchinterest, nearest, tp, 0)
+                                pcall(firetouchinterest, nearest, tp, 1)
+                            end
+                        end
                     end
                 end
             end)
