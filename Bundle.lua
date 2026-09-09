@@ -468,49 +468,79 @@ local function GetGoalCorner(cornerName)
 end
 
 -- Korudugumuz Kaleyi Bul (Kaleciye En Yakin Kale veya Bulunamazsa Kalecinin Mevcut Konumu)
+local _defendedGoalCache = nil
+local _defendedGoalCacheTime = 0
+
 local function GetMyGoal()
+    local now = tick()
     local root = GetRoot()
-    if not root then return nil, math.huge end
-    local goals = {}
+    if not root then return nil, 0 end
 
-    -- 1. [ÖZEL] Oyundaki Map.Data veya Goals klasoru
-    local mapFolder = workspace:FindFirstChild("Map")
-    if mapFolder then
-        local dataFolder = mapFolder:FindFirstChild("Data")
-        if dataFolder then
-            for _, child in ipairs(dataFolder:GetDescendants()) do
-                if child:IsA("BasePart") and child.Name:lower():find("goal") then
-                    table.insert(goals, child)
+    if _defendedGoalCache and _defendedGoalCache.Parent and (now - _defendedGoalCacheTime < 3.0) then
+        return _defendedGoalCache, (root.Position - _defendedGoalCache.Position).Magnitude
+    end
+
+    _defendedGoalCacheTime = now
+    local myPos = root.Position
+    local bestGoal = nil
+    local minD = math.huge
+
+    -- 1. PracticeSession / Game Match üzerinden korunan kale
+    pcall(function()
+        local ps = require(ReplicatedStorage.Client.Gameplay.PracticeSession)
+        if ps and ps.GetDefendedGoalPart then
+            local gp = ps.GetDefendedGoalPart()
+            if gp and gp:IsA("BasePart") then
+                bestGoal = gp
+                minD = (myPos - gp.Position).Magnitude
+            end
+        end
+    end)
+
+    if bestGoal then
+        _defendedGoalCache = bestGoal
+        return bestGoal, minD
+    end
+
+    -- 2. workspace.Map.Data içindeki Goal partları
+    pcall(function()
+        local mapData = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Data")
+        if mapData then
+            for _, teamFolder in ipairs(mapData:GetChildren()) do
+                local g = teamFolder:FindFirstChild("Goal")
+                if g and g:IsA("BasePart") then
+                    local d = (myPos - g.Position).Magnitude
+                    if d < minD then
+                        minD = d
+                        bestGoal = g
+                    end
                 end
             end
         end
+    end)
+
+    if bestGoal then
+        _defendedGoalCache = bestGoal
+        return bestGoal, minD
     end
 
-    -- 2. Workspace genelinde kale parçaları
-    if #goals == 0 then
-        for _, v in ipairs(workspace:GetDescendants()) do
-            if v:IsA("BasePart") and (v.Size.X > 4 or v.Size.Z > 4) then
-                local n = v.Name:lower()
-                if n:find("goal") or n:find("kale") or n:find("net") or n:find("post") or n:find("direk") then
-                    table.insert(goals, v)
-                end
-            end
-        end
-    end
-
-    if #goals > 0 then
-        local closest, minD = nil, math.huge
-        for _, g in ipairs(goals) do
-            local d = (root.Position - g.Position).Magnitude
-            if d < minD then
+    -- 3. Workspace genelinde Goal partları (Kaleciye en yakın olanı bizim kalemizdir)
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BasePart") and (obj.Name == "Goal" or obj.Name:find("GoalPart") or obj.Name:find("GoalNet")) then
+            local d = (myPos - obj.Position).Magnitude
+            if d < minD and d < 350 then
                 minD = d
-                closest = g
+                bestGoal = obj
             end
         end
-        return closest, minD
     end
 
-    -- Eger sahadaki kale bulunamazsa, kalecinin mevcut konumunu referans al
+    if bestGoal then
+        _defendedGoalCache = bestGoal
+        return bestGoal, minD
+    end
+
+    -- 4. Bulunamazsa kalecinin kendi pozisyonunu döndür
     return root, 0
 end
 
@@ -822,7 +852,7 @@ local function PressInGameDiveButton(showNotification, overrideDir)
 end
 
 -- ===============================================================
--- 🧤 GELİŞMİŞ AKILLI KALECİ YAPAY ZEKASI (PLANJON AUTO-DIVE)
+-- 🧤 AKILLI KALECİ SİSTEMİ (TOP KILAVUZU & GERÇEK SIÇRAYARAK KURTARIŞ)
 -- ===============================================================
 local _lastDiveTime = 0
 
@@ -830,115 +860,136 @@ local function RunGoalkeeperAI()
     if not Config.GK.AutoDive then return end
 
     local now = tick()
-    if now - _lastDiveTime < 0.8 then return end -- Cooldown (Spam engeli)
+    if now - _lastDiveTime < 0.6 then return end -- Cooldown (Seri atlayış engeli)
 
     local ball = FindBall()
     local myRoot = GetRoot()
     local char = GetChar()
     local hum = GetHum()
-    if not ball or not myRoot or not char or not hum then return end
+    if not ball or not myRoot or not char or not hum or hum.Health <= 0 then return end
 
     -- Top zaten bizdeyse atlama
     if DoIHaveBall() then return end
 
-    -- Korudugumuz kaleyi bul
-    local myGoal, distToGoal = GetMyGoal()
-    if not myGoal then myGoal = myRoot; distToGoal = 0 end
-
+    local myPos = myRoot.Position
     local ballPos = ball.Position
-    local ballVel = GetBallVelocity(ball)
-    local ballSpeed = ballVel.Magnitude
 
-    -- 1. DURAN TOP FILTRESI (Sadece tamamen duran ve uzaktaki toplara atlamaz)
-    if Config.GK.SmartThreatOnly and ballSpeed < Config.GK.MinShotSpeed and distToMe > 14 and distToGoal > 15 then
+    -- 1. OYUNUN GERÇEK HIZ & KILAVUZ ÇİZGİSİ VERİLERİNİ AL (Renderer Modülü)
+    local ballVel = Vector3.new(0, 0, 0)
+    local isAirborne = false
+    local flightStartedAt = nil
+
+    pcall(function()
+        local Renderer = require(ReplicatedStorage.Client.Gameplay.Ball.Renderer)
+        if Renderer and Renderer.GetMovementState then
+            local ms = Renderer.GetMovementState()
+            if ms then
+                if ms.Velocity and ms.Velocity.Magnitude > 2 then
+                    ballVel = ms.Velocity
+                end
+                isAirborne = (ms.Mode == "Airborne")
+                flightStartedAt = ms.FlightStartedAt or ms.StartedAt
+            end
+        end
+    end)
+
+    if ballVel.Magnitude <= 2 then
+        ballVel = GetBallVelocity(ball)
+    end
+
+    local ballSpeed = ballVel.Magnitude
+    local distToMe = (myPos - ballPos).Magnitude
+
+    -- 2. TOP AYAKTAN ÇIKTI MI? (Şut Başlangıcı Tespiti)
+    local isShotActive = (ballSpeed >= 10) or isAirborne
+    if not isShotActive then
+        -- Top yavaşsa veya duruyorsa sadece kalecinin dibindeyse (8 stud) atla
+        if distToMe > 8 then return end
+    end
+
+    -- Korunan Kaleyi Bul
+    local myGoal, distToGoal = GetMyGoal()
+    local goalPos = (myGoal and myGoal.Position) or myPos
+
+    -- 3. HEDEF & YÖN KONTROLÜ (Top Kaleye veya Kaleciye Doğru mu Geliyor?)
+    local toMe = (myPos - ballPos).Unit
+    local toGoal = (goalPos - ballPos).Unit
+    local dotMe = ballSpeed > 0.5 and ballVel.Unit:Dot(toMe) or 1
+    local dotGoal = ballSpeed > 0.5 and ballVel.Unit:Dot(toGoal) or 1
+
+    -- Top kaleciden ve kaleden tamamen uzaklaşıyorsa (ters yöne gidiyorsa) atlama
+    if distToMe > 12 and (dotMe < -0.3 and dotGoal < -0.3) then
         return
     end
 
-    local myPos = myRoot.Position
-    local distToMe = (myPos - ballPos).Magnitude
-    if distToMe > Config.GK.DiveRange then return end
+    -- 4. KILAVUZ ÇİZGİSİ VE VARIŞ ZAMANI ("KALEYE GELİNCE")
+    local closingSpeed = math.max(ballSpeed, 24)
+    local timeToArrive = distToMe / closingSpeed
 
-    -- 2. ACI VE YON FILTRESI (Top kaleciye veya kaleye doğru mu geliyor?)
-    local toMe = (myPos - ballPos).Unit
-    local toGoal = (myGoal.Position - ballPos).Unit
-    local dotMe, dotGoal = 1, 1
-    if ballSpeed > 0.5 then
-        dotMe = ballVel.Unit:Dot(toMe)
-        dotGoal = ballVel.Unit:Dot(toGoal)
+    -- Top henüz uzaktaysa (0.55 saniyeden fazla varsa) kaleye yaklaşana kadar bekle!
+    if timeToArrive > 0.55 and distToMe > 32 then
+        return
     end
 
-    -- Top kaleciden veya kaleden tamamen ters yöne uzaklaşıyorsa atlama (14 stud'dan uzaktaysa)
-    if distToMe > 14.0 and Config.GK.SmartThreatOnly and ballSpeed > 0.5 then
-        if dotMe < -0.25 and dotGoal < -0.25 then
-            return
-        end
-    end
-
-    -- 3. ZAMANLAMA VE TAHMİNİ VARIŞ NOKTASI
-    local closingSpeed = math.max(ballSpeed, 18)
-    local timeToArrive = math.clamp(distToMe / closingSpeed, 0.05, 1.8)
-
-    local g = -workspace.Gravity * 0.5
-    local predictedBallPos = ballPos + (ballVel * timeToArrive) + Vector3.new(0, g * (timeToArrive ^ 2), 0)
-
-    -- ═══════════════════════════════════════════════════════════
-    -- 🚀 HEDEF ŞUT ONAYLANDI: PLANJON & KESIN TUTUS BASLATILIYOR!
-    -- ═══════════════════════════════════════════════════════════
-    _lastDiveTime = now
-
-    -- Kaleci ile topun bulusacagi ideal kurtaris noktasi
-    local interceptPos = myPos:Lerp(predictedBallPos, 0.65)
-    local diveVec = (interceptPos - myPos)
-    local diveDir2D = Vector3.new(diveVec.X, 0, diveVec.Z)
-    if diveDir2D.Magnitude > 0.05 then
+    -- 5. SIÇRAMA VE KURTARIŞ NOKTASI (Topun Geldiği Yön)
+    local predictedIntercept = ballPos + (ballVel * math.clamp(timeToArrive, 0.05, 0.45))
+    local saveVec = (predictedIntercept - myPos)
+    local diveDir2D = Vector3.new(saveVec.X, 0, saveVec.Z)
+    if diveDir2D.Magnitude > 0.1 then
         diveDir2D = diveDir2D.Unit
     else
         diveDir2D = myRoot.CFrame.LookVector
     end
 
-    -- A) Karakteri topun gelis yonune aninda cevir
+    -- ═══════════════════════════════════════════════════════════
+    -- 🚀 GERÇEK VE GÜÇLÜ SIÇRAYARAK PLANJON (LEAP & DIVE ACTION)
+    -- ═══════════════════════════════════════════════════════════
+    _lastDiveTime = now
+
+    -- A) Karakteri anında topun geldiği yöne çevir
     pcall(function()
         myRoot.CFrame = CFrame.lookAt(myPos, myPos + Vector3.new(diveDir2D.X, 0, diveDir2D.Z))
     end)
 
-    -- B) YÜRÜME YÖNÜNÜ KESİNTİSİZ TOPA DOĞRU TUT (Oyun yürüdüğün yöne doğru planjon yaptığı için!)
+    -- B) OYUNUN KENDİ PLANJON VE TUŞ PROTOKOLÜNÜ TETİKLE
     task.spawn(function()
-        local walkStart = tick()
-        while tick() - walkStart < 0.35 do
-            if not hum or not myRoot then break end
-            hum:Move(diveDir2D, false)
-            task.wait(0.02)
+        PressInGameDiveButton(false, diveDir2D)
+        task.wait(0.04)
+        PressInGameDiveButton(false, diveDir2D)
+    end)
+
+    -- C) GERÇEK FİZİKSEL SIÇRAMA (JUMP & HIGH-VELOCITY LEAP)
+    -- Karakter havaya doğru ve topun geldiği yöne doğru güçlü bir sıçrama yapar!
+    task.spawn(function()
+        -- Humanoid jump tetikle
+        hum:ChangeState(Enum.HumanoidStateType.Jumping)
+        hum.Jump = true
+
+        -- Yukarı ve ileri doğru güçlü sıçrama ivmesi
+        local heightDiff = math.clamp(predictedIntercept.Y - myPos.Y, -2, 14)
+        local verticalImpulse = math.clamp(26 + (heightDiff * 1.8), 24, 48)
+        local forwardImpulse = math.clamp(distToMe * 1.8 + 28, 38, 62)
+
+        local leapVel = (diveDir2D * forwardImpulse) + Vector3.new(0, verticalImpulse, 0)
+
+        -- İvmeyi 0.20 saniye boyunca uygulayarak Roblox fiziğinin ezmesini engelle
+        local leapStart = tick()
+        while tick() - leapStart < 0.20 do
+            if not myRoot or not hum or hum.Health <= 0 then break end
+            myRoot.AssemblyLinearVelocity = Vector3.new(leapVel.X, myRoot.AssemblyLinearVelocity.Y > 0 and myRoot.AssemblyLinearVelocity.Y or leapVel.Y, leapVel.Z)
+            task.wait(0.025)
         end
     end)
 
-    -- C) PLANJON BUTONUNU VE PROTOKOLÜNÜ HEDEF YÖNÜYLE TETİKLE
-    task.spawn(function()
-        PressInGameDiveButton(false, diveDir2D)
-        task.wait(0.03)
-        PressInGameDiveButton(false, diveDir2D)
-        task.wait(0.05)
-        PressInGameDiveButton(false, diveDir2D)
-    end)
-
-    -- D) Fiziksel sıçrama ve ivme desteği (Topu havada kesin karşılamak için)
-    if Config.GK.BoostPhysical then
-        hum.Jump = true
-        local verticalImpulse = math.clamp((interceptPos.Y - myPos.Y) * 11 + 16, 14, 38)
-        local leapSpeed = math.clamp(diveVec.Magnitude * 20, 28, 55)
-        myRoot.AssemblyLinearVelocity = (diveDir2D * leapSpeed) + Vector3.new(0, verticalImpulse, 0)
-    end
-
-    -- E) KESİN TUTUŞ / TOPU YAKALAMA (100% Catch & Retention)
+    -- D) KESİN TUTUŞ (100% TOUCH & CATCH)
     if Config.GK.PerfectCatch then
         task.spawn(function()
-            local saveStart = tick()
-            while tick() - saveStart < 0.85 do
+            local catchStart = tick()
+            while tick() - catchStart < 0.75 do
                 task.wait(0.02)
                 if not ball or not myRoot then break end
-
                 local curDist = (myRoot.Position - ball.Position).Magnitude
-                if curDist <= 8.0 then
-                    -- Tum vucut ve kollar ile temas kur
+                if curDist <= 10.0 then
                     local touchParts = {
                         char:FindFirstChild("RightHand") or char:FindFirstChild("Right Arm"),
                         char:FindFirstChild("LeftHand") or char:FindFirstChild("Left Arm"),
@@ -946,22 +997,15 @@ local function RunGoalkeeperAI()
                         char:FindFirstChild("Head"),
                         myRoot
                     }
-                    for _, p in ipairs(touchParts) do
-                        if p and firetouchinterest then
-                            pcall(firetouchinterest, p, ball, 0)
-                            pcall(firetouchinterest, p, ball, 1)
-                            pcall(firetouchinterest, ball, p, 0)
-                            pcall(firetouchinterest, ball, p, 1)
+                    if firetouchinterest then
+                        for _, p in ipairs(touchParts) do
+                            if p then
+                                pcall(firetouchinterest, p, ball, 0)
+                                pcall(firetouchinterest, p, ball, 1)
+                                pcall(firetouchinterest, ball, p, 0)
+                                pcall(firetouchinterest, ball, p, 1)
+                            end
                         end
-                    end
-
-                    -- Topu kalecinin onunde kitle / ellerin arasina al
-                    if curDist <= 4.5 then
-                        local handsPos = myRoot.Position + (myRoot.CFrame.LookVector * 1.5) + Vector3.new(0, 0.4, 0)
-                        ball.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-                        ball.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
-                        ball.CFrame = CFrame.new(handsPos)
-                        break
                     end
                 end
             end
@@ -1723,9 +1767,9 @@ local THEME = {
 }
 
 local viewSize = (Camera and Camera.ViewportSize.X > 100) and Camera.ViewportSize or Vector2.new(800, 600)
-local WIN_W = IS_MOBILE and math.clamp(viewSize.X - 24, 320, 520) or 560
-local WIN_H = IS_MOBILE and math.clamp(viewSize.Y - 32, 280, 390) or 410
-local TAB_W = IS_MOBILE and 110 or 135
+local WIN_W = IS_MOBILE and math.clamp(viewSize.X - 24, 300, 420) or 440
+local WIN_H = IS_MOBILE and math.clamp(viewSize.Y - 32, 250, 300) or 285
+local TAB_W = IS_MOBILE and 100 or 110
 
 local function MI(cls, props, parent)
     local inst = Instance.new(cls)
@@ -1884,58 +1928,86 @@ task.spawn(function()
 end)
 
 -- ===============================================================
--- 📱 YÜZEN MOBİL BUTON (FLOAT BUTTON)
+-- 📱 YÜZEN MOBİL BUTON (FLOAT BUTTON) — STABLE DRAG
 -- ===============================================================
+local BTN_SIZE = 42
 local floatBtn = MI("TextButton", {
     Name = "FloatToggle",
-    Size = UDim2.new(0, 50, 0, 50),
-    Position = UDim2.new(0, 16, 0.5, -25),
+    Size = UDim2.new(0, BTN_SIZE, 0, BTN_SIZE),
+    Position = UDim2.new(0, 14, 0.45, -BTN_SIZE / 2),
     BackgroundColor3 = THEME.Sidebar,
     Text = "⚽",
     TextColor3 = Color3.fromRGB(255, 255, 255),
     Font = Enum.Font.GothamBold,
-    TextSize = 24,
+    TextSize = 21,
     BorderSizePixel = 0,
     ZIndex = 1200,
     AutoButtonColor = false,
 }, guiRoot)
-Corner(floatBtn, 25)
+Corner(floatBtn, BTN_SIZE / 2)
 Stroke(floatBtn, THEME.Accent, 1.8, 0.1)
 
--- Altında Mini By Umut Rozeti
-local miniTag = MI("TextLabel", {
-    Size = UDim2.new(0, 56, 0, 14),
-    Position = UDim2.new(0.5, -28, 1, 2),
-    BackgroundColor3 = Color3.fromRGB(15, 18, 26),
-    Text = "By Umut",
-    TextColor3 = THEME.Gold,
-    Font = Enum.Font.GothamBold,
-    TextSize = 9,
-    BorderSizePixel = 0,
-    ZIndex = 1201,
-}, floatBtn)
-Corner(miniTag, 4)
-Stroke(miniTag, THEME.Gold, 1, 0.4)
-
--- Buton Dokunmatik & Fare ile Sürükleme
+-- Kararlı Sürükleme: Click/Drag Eşiği + Ekran Sınırı
 do
-    local drag, dragStart, startPos = false, nil, nil
-    floatBtn.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-            drag = true
-            dragStart = i.Position
-            startPos = floatBtn.Position
+    local DRAG_THRESHOLD = 6  -- px — altında sürükleme başlamaz (tap korunur)
+    local dragging = false
+    local didDrag  = false
+    local inputId  = nil
+    local dragStartPos  = nil  -- ekran pozisyonu (touch/mouse)
+    local btnStartX, btnStartY = 14, nil  -- başlangıç offset
+
+    floatBtn.InputBegan:Connect(function(inp)
+        local t = inp.UserInputType
+        if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+            inputId = inp
+            dragging  = false
+            didDrag   = false
+            dragStartPos = Vector2.new(inp.Position.X, inp.Position.Y)
+            btnStartX    = floatBtn.Position.X.Offset
+            btnStartY    = floatBtn.Position.Y.Offset
         end
     end)
-    UserInputService.InputChanged:Connect(function(i)
-        if drag and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
-            local delta = i.Position - dragStart
-            floatBtn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+
+    UserInputService.InputChanged:Connect(function(inp)
+        if not inputId then return end
+        local t = inp.UserInputType
+        if t ~= Enum.UserInputType.MouseMovement and t ~= Enum.UserInputType.Touch then return end
+
+        local dx = inp.Position.X - dragStartPos.X
+        local dy = inp.Position.Y - dragStartPos.Y
+
+        if not dragging then
+            if math.sqrt(dx * dx + dy * dy) >= DRAG_THRESHOLD then
+                dragging = true
+                didDrag  = true
+            else
+                return
+            end
         end
+
+        -- Ekran sınırlarına sabitle
+        local vp = Camera and Camera.ViewportSize or Vector2.new(800, 600)
+        local newX = math.clamp(btnStartX + dx, 4, vp.X - BTN_SIZE - 4)
+        local newY = math.clamp(btnStartY + dy, 4, vp.Y - BTN_SIZE - 4)
+        floatBtn.Position = UDim2.new(0, newX, 0, newY)
     end)
-    local function stopDrag() drag = false end
-    floatBtn.InputEnded:Connect(stopDrag)
-    UserInputService.InputEnded:Connect(stopDrag)
+
+    local function onInputEnd(inp)
+        if inp ~= inputId then return end
+        dragging = false
+        inputId  = nil
+    end
+
+    floatBtn.InputEnded:Connect(onInputEnd)
+    UserInputService.InputEnded:Connect(onInputEnd)
+
+    -- Tap (click) → sadece drag olmadıysa menüyü aç
+    floatBtn.MouseButton1Click:Connect(function()
+        if not didDrag then
+            mainFrame.Visible = not mainFrame.Visible
+        end
+        didDrag = false
+    end)
 end
 
 -- ===============================================================
@@ -1953,24 +2025,24 @@ local mainFrame = MI("Frame", {
 Corner(mainFrame, 12)
 Stroke(mainFrame, THEME.Border, 1.4)
 
-floatBtn.MouseButton1Click:Connect(function()
-    mainFrame.Visible = not mainFrame.Visible
-end)
+
+
 
 -- ─────────────────────────────────────────────────────────
--- BAŞLIK ÇUBUĞU (HEADER)
+-- BAŞLIK ÇUBUĞU (HEADER) — 38px compact
 -- ─────────────────────────────────────────────────────────
+local HDR_H = 38
 local header = MI("Frame", {
-    Size = UDim2.new(1, 0, 0, 46),
+    Size = UDim2.new(1, 0, 0, HDR_H),
     BackgroundColor3 = THEME.Sidebar,
     BorderSizePixel = 0,
 }, mainFrame)
-Corner(header, 12)
--- Alt köşelerin yuvarlaklığını düzeltmek için alt dolgu
+Corner(header, 10)
+-- Alt köşeleri doldur
 MI("Frame", { Size = UDim2.new(1, 0, 0, 10), Position = UDim2.new(0, 0, 1, -10), BackgroundColor3 = THEME.Sidebar, BorderSizePixel = 0 }, header)
 MI("Frame", { Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 1, -1), BackgroundColor3 = THEME.Border, BorderSizePixel = 0 }, header)
 
--- Başlık Sürükleme
+-- Başlık Sürükleme (Ekran Sınırlı)
 do
     local drag, dragStart, startPos = false, nil, nil
     header.InputBegan:Connect(function(i)
@@ -1983,54 +2055,38 @@ do
     UserInputService.InputChanged:Connect(function(i)
         if drag and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
             local delta = i.Position - dragStart
-            mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+            local vp = Camera and Camera.ViewportSize or Vector2.new(800, 600)
+            local ox = math.clamp(startPos.X.Offset + delta.X, -WIN_W + 60, vp.X - 60)
+            local oy = math.clamp(startPos.Y.Offset + delta.Y, -HDR_H + 8, vp.Y - HDR_H)
+            mainFrame.Position = UDim2.new(startPos.X.Scale, ox, startPos.Y.Scale, oy)
         end
     end)
-    local function endHeaderDrag() drag = false end
-    header.InputEnded:Connect(endHeaderDrag)
-    UserInputService.InputEnded:Connect(endHeaderDrag)
+    local function endDrag() drag = false end
+    header.InputEnded:Connect(endDrag)
+    UserInputService.InputEnded:Connect(endDrag)
 end
 
--- Sol Logo & Başlık
-local titleTxt = MI("TextLabel", {
-    Size = UDim2.new(0, 160, 1, 0),
-    Position = UDim2.new(0, 14, 0, 0),
+-- Başlık Metni
+MI("TextLabel", {
+    Size = UDim2.new(1, -60, 1, 0),
+    Position = UDim2.new(0, 10, 0, 0),
     BackgroundTransparency = 1,
     Text = "⚽ FutbolUmsu",
     TextColor3 = THEME.TextMain,
     Font = Enum.Font.GothamBold,
-    TextSize = 14,
+    TextSize = 13,
     TextXAlignment = Enum.TextXAlignment.Left,
 }, header)
 
--- Altın Sarısı BY UMUT Rozeti
-local headerBadge = MI("Frame", {
-    Size = UDim2.new(0, 80, 0, 20),
-    Position = UDim2.new(0, 135, 0.5, -10),
-    BackgroundColor3 = Color3.fromRGB(36, 32, 18),
-    BorderSizePixel = 0,
-}, header)
-Corner(headerBadge, 6)
-Stroke(headerBadge, THEME.Gold, 1, 0.3)
-
-MI("TextLabel", {
-    Size = UDim2.fromScale(1, 1),
-    BackgroundTransparency = 1,
-    Text = "BY UMUT",
-    TextColor3 = THEME.Gold,
-    Font = Enum.Font.GothamBold,
-    TextSize = 10,
-}, headerBadge)
-
--- Kapatma & Gizleme Butonları
+-- Kapatma Butonu
 local closeBtn = MI("TextButton", {
-    Size = UDim2.new(0, 30, 0, 30),
-    Position = UDim2.new(1, -38, 0.5, -15),
+    Size = UDim2.new(0, 26, 0, 26),
+    Position = UDim2.new(1, -32, 0.5, -13),
     BackgroundColor3 = Color3.fromRGB(35, 20, 25),
     Text = "✕",
     TextColor3 = THEME.Danger,
     Font = Enum.Font.GothamBold,
-    TextSize = 13,
+    TextSize = 12,
     BorderSizePixel = 0,
     AutoButtonColor = false,
 }, header)
@@ -2038,27 +2094,12 @@ Corner(closeBtn, 6)
 Stroke(closeBtn, THEME.Danger, 1, 0.5)
 closeBtn.MouseButton1Click:Connect(function() mainFrame.Visible = false end)
 
-local minBtn = MI("TextButton", {
-    Size = UDim2.new(0, 30, 0, 30),
-    Position = UDim2.new(1, -74, 0.5, -15),
-    BackgroundColor3 = THEME.Surface,
-    Text = "—",
-    TextColor3 = THEME.TextSub,
-    Font = Enum.Font.GothamBold,
-    TextSize = 12,
-    BorderSizePixel = 0,
-    AutoButtonColor = false,
-}, header)
-Corner(minBtn, 6)
-Stroke(minBtn, THEME.Border, 1)
-minBtn.MouseButton1Click:Connect(function() mainFrame.Visible = false end)
-
 -- ─────────────────────────────────────────────────────────
 -- SOL SEKME MENÜSÜ (SIDEBAR)
 -- ─────────────────────────────────────────────────────────
 local sidebar = MI("Frame", {
-    Size = UDim2.new(0, TAB_W, 1, -46),
-    Position = UDim2.new(0, 0, 0, 46),
+    Size = UDim2.new(0, TAB_W, 1, -HDR_H),
+    Position = UDim2.new(0, 0, 0, HDR_H),
     BackgroundColor3 = THEME.Sidebar,
     BorderSizePixel = 0,
 }, mainFrame)
@@ -2089,8 +2130,8 @@ local footerSign = MI("TextLabel", {
 -- SAĞ İÇERİK ALANI (CONTENT AREA)
 -- ─────────────────────────────────────────────────────────
 local contentArea = MI("Frame", {
-    Size = UDim2.new(1, -TAB_W, 1, -46),
-    Position = UDim2.new(0, TAB_W, 0, 46),
+    Size = UDim2.new(1, -TAB_W, 1, -HDR_H),
+    Position = UDim2.new(0, TAB_W, 0, HDR_H),
     BackgroundTransparency = 1,
     BorderSizePixel = 0,
     ClipsDescendants = true,
